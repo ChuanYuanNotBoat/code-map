@@ -1,16 +1,19 @@
 //! Code Map: fly over a codebase as a zoomable GPU treemap.
 //!
-//!   cargo run --release -- /path/to/project
+//!   cargo run --release -- /path/to/project [--3d]
 //!   cargo run --release --bin scan -- /path/to/project   (no window, just stats)
 
 pub use makepad_widgets;
 
+mod history;
 mod map_view;
 mod model;
+mod orbit;
 mod scan;
 
 use makepad_widgets::*;
 use map_view::{CodeMapAction, CodeMapWidgetRefExt};
+use model::ColorMode;
 use std::path::PathBuf;
 
 app_main!(App);
@@ -42,6 +45,15 @@ script_mod! {
                             text: "Code Map"
                             draw_text +: {color: #xffffff text_style +: {font_size: 10.0}}
                         }
+                        search := TextInput{
+                            width: 220 height: 28
+                            empty_text: "Search files and folders"
+                        }
+                        color_mode := DropDown{
+                            width: 150
+                            labels: ["File type" "Recently changed" "Most changed"]
+                        }
+                        three_d := CheckBox{text: "3D" active: false}
                         fit_button := Button{text: "Fit"}
                         show_ignored := CheckBox{text: "Show ignored" active: true}
                         status := Label{
@@ -73,7 +85,7 @@ script_mod! {
                             info_details := InfoLabel{text: ""}
                             View{width: Fill height: Fill}
                             InfoLabel{
-                                text: "Scroll: zoom\nDrag: pan\nClick: inspect\nDouble click: fly to it\nStriped boxes are ignored by git.\nClick one to read it."
+                                text: "Scroll: zoom\nDrag: pan (2D) or orbit (3D)\nShift or right drag: pan (3D)\nClick: inspect\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
                             }
                         }
                     }
@@ -100,7 +112,12 @@ impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         let path = project_path();
         self.ui.label(cx, ids!(title)).set_text(cx, &format!("Code Map: {}", path.display()));
-        self.ui.code_map(cx, ids!(map)).open(cx, path);
+        let map = self.ui.code_map(cx, ids!(map));
+        map.open(cx, path);
+        if std::env::args().any(|a| a == "--3d") {
+            self.ui.check_box(cx, ids!(three_d)).set_active(cx, true, Animate::No);
+            map.set_3d(cx, true);
+        }
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
@@ -110,6 +127,28 @@ impl MatchEvent for App {
         }
         if let Some(show) = self.ui.check_box(cx, ids!(show_ignored)).changed(actions) {
             map.set_show_ignored(cx, show);
+        }
+        if let Some(on) = self.ui.check_box(cx, ids!(three_d)).changed(actions) {
+            map.set_3d(cx, on);
+        }
+        if let Some(index) = self.ui.drop_down(cx, ids!(color_mode)).changed(actions) {
+            let mode = match index {
+                1 => ColorMode::Recent,
+                2 => ColorMode::Churn,
+                _ => ColorMode::FileType,
+            };
+            map.set_color_mode(cx, mode);
+        }
+        let search = self.ui.text_input(cx, ids!(search));
+        if let Some(query) = search.changed(actions) {
+            map.set_search(cx, &query);
+        }
+        if search.returned(actions).is_some() {
+            map.next_match(cx);
+        }
+        if search.escaped(actions) {
+            search.set_text(cx, "");
+            map.set_search(cx, "");
         }
         // A widget can emit several actions in one batch, so look at all of them.
         let uid = map.widget_uid();

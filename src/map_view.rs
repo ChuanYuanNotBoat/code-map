@@ -1,12 +1,16 @@
-//! The map widget: draws the tree as nested rectangles and lets you fly
-//! around it. Scroll to zoom, drag to pan, click to inspect, double click
-//! to fly into something. Click a striped (ignored) box to read it.
+//! The map widget: draws the tree as nested rectangles (2D) or as a city of
+//! boxes (3D) and lets you fly around it.
 //!
-//! Everything on screen is a quad drawn by one tiny pixel shader. Makepad
-//! batches all quads of the same shader into one GPU draw call, which is why
-//! drawing a hundred thousand of them per frame is fine.
+//! 2D: everything is a quad drawn by one tiny pixel shader. Makepad batches
+//! all quads of the same shader into one GPU draw call, which is why drawing
+//! a hundred thousand of them per frame is fine.
+//! 3D: see `city.rs`.
 
-use crate::model::{code_inner, frame, Kind, Tree, CHAR_W, COL_CHARS, R};
+mod city;
+
+use crate::history::{self, History};
+use crate::model::{code_inner, frame, ColorMode, Kind, Tree, CHAR_W, COL_CHARS, R};
+use crate::orbit::Orbit;
 use crate::scan::{self, Entry};
 use makepad_widgets::*;
 use std::{
@@ -49,12 +53,25 @@ script_mod! {
         }
     }
 
+    // Shows the offscreen 3D render (a texture) as a flat quad in the UI,
+    // like rendering a Three.js scene to a WebGLRenderTarget.
+    set_type_default() do #(DrawSceneTexture::script_shader(vm)){
+        ..mod.draw.DrawQuad
+        scene_texture: texture_2d(float)
+        pixel: fn() {
+            let c = self.scene_texture.sample_as_bgra(self.pos)
+            return vec4(c.rgb * c.w, c.w)
+        }
+    }
+
     mod.widgets.CodeMapBase = #(CodeMap::register_widget(vm))
     mod.widgets.CodeMap = set_type_default() do mod.widgets.CodeMapBase{
         width: Fill
         height: Fill
         draw_bg +: {color: #x07090c}
         draw_block +: {}
+        draw_scene +: {}
+        draw_cube +: {}
         draw_label +: {
             color: #xe6ebf0
             text_style: theme.font_regular{font_size: 8.0}
@@ -81,6 +98,13 @@ pub struct DrawBlock {
     hatch: f32,
 }
 
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneTexture {
+    #[deref]
+    draw_super: DrawQuad,
+}
+
 /// What the app shows in the inspector panel.
 #[derive(Clone, Debug, Default)]
 pub struct NodeInfo {
@@ -100,6 +124,7 @@ pub enum CodeMapAction {
 enum ScanMsg {
     Project(Result<scan::ProjectScan, String>, f64),
     Expanded(String, Vec<Entry>),
+    History(Result<History, String>),
 }
 
 struct Label {
@@ -111,9 +136,12 @@ struct Label {
 #[derive(Clone, Copy)]
 struct Drag {
     start: DVec2,
+    last: DVec2,
     start_off: DVec2,
     moved: bool,
     taps: u32,
+    /// Right button or shift: pan instead of orbit (3D only).
+    pan: bool,
 }
 
 #[derive(Script, ScriptHook, Widget)]
@@ -132,9 +160,26 @@ pub struct CodeMap {
     #[live]
     draw_block: DrawBlock,
     #[live]
+    draw_scene: DrawSceneTexture,
+    #[live]
+    draw_cube: DrawCube,
+    #[live]
     draw_label: DrawText,
     #[live]
     draw_code: DrawText,
+
+    // 3D render target: its own render pass with color and depth textures.
+    // `#[new]` means "create this with ::new(cx)" when the widget is built.
+    #[new]
+    pass: DrawPass,
+    #[new]
+    draw_list: DrawList,
+    #[new]
+    color_texture: Texture,
+    #[new]
+    depth_texture: Texture,
+    #[rust]
+    pass_ready: bool,
 
     #[rust]
     root: PathBuf,
@@ -152,20 +197,42 @@ pub struct CodeMap {
     /// World size of the whole map.
     #[rust]
     world: R,
-    /// Camera: screen = view.pos + (world - cam_off) * cam_scale
+    /// 2D camera: screen = view.pos + (world - cam_off) * cam_scale
     #[rust]
     cam_scale: f64,
     #[rust]
     cam_off: DVec2,
-    /// Where a double click is flying the camera to: (world center, scale).
+    /// Where a double click is flying the 2D camera to: (world center, scale).
     #[rust]
     flight: Option<(DVec2, f64)>,
+    #[rust]
+    mode_3d: bool,
+    #[rust]
+    orbit: Orbit,
+    /// Where the 3D camera is flying to: (target, distance).
+    #[rust]
+    orbit_flight: Option<(Vec3f, f32)>,
+    /// Boxes drawn in the last 3D frame, for mouse picking.
+    #[rust]
+    picks: Vec<(usize, Vec3f, Vec3f)>,
     #[rust]
     drag: Option<Drag>,
     #[rust]
     hover: Option<usize>,
     #[rust]
+    hover_abs: DVec2,
+    #[rust]
     selected: Option<usize>,
+    #[rust]
+    color_mode: ColorMode,
+    #[rust]
+    history: Option<History>,
+    #[rust]
+    search: String,
+    #[rust]
+    matches: Vec<usize>,
+    #[rust]
+    match_cursor: usize,
     #[rust]
     tx: Option<Sender<ScanMsg>>,
     #[rust]
@@ -190,14 +257,14 @@ impl CodeMap {
         self.root = root.clone();
         self.selected = None;
         self.hover = None;
+        self.history = None;
         self.text_cache.clear();
         let (tx, rx) = channel();
         let worker_tx = tx.clone();
         self.tx = Some(tx);
         self.rx = Some(rx);
         self.pending = 1;
-        self.message = format!("Scanning {} ...", root.display());
-        cx.widget_action(self.uid, CodeMapAction::Status(self.message.clone()));
+        self.set_status(cx, format!("Scanning {} ...", root.display()));
         // Scanning runs on a background thread so the window stays responsive.
         // `move` hands ownership of `root` and the sender to that thread.
         std::thread::spawn(move || {
@@ -209,15 +276,84 @@ impl CodeMap {
         self.redraw(cx);
     }
 
+    fn set_status(&mut self, cx: &mut Cx, message: String) {
+        self.message = message;
+        cx.widget_action(self.uid, CodeMapAction::Status(self.message.clone()));
+    }
+
     pub fn set_show_ignored(&mut self, cx: &mut Cx, show: bool) {
         self.show_ignored = show;
         self.needs_layout = true;
         self.redraw(cx);
     }
 
+    pub fn set_color_mode(&mut self, cx: &mut Cx, mode: ColorMode) {
+        self.color_mode = mode;
+        self.tree.compute_heat(mode);
+        if mode != ColorMode::FileType && self.history.is_none() {
+            self.set_status(cx, "Reading git history ...".to_string());
+        }
+        self.redraw(cx);
+    }
+
+    pub fn set_search(&mut self, cx: &mut Cx, query: &str) {
+        self.search = query.trim().to_string();
+        self.matches = self.tree.search(&self.search);
+        self.match_cursor = 0;
+        if self.search.is_empty() {
+            self.set_status(cx, self.summary());
+        } else {
+            let text = format!("{} matches for \"{}\". Press Enter to fly to the next one.", fmt_num(self.matches.len() as u64), self.search);
+            self.set_status(cx, text);
+        }
+        self.redraw(cx);
+    }
+
+    pub fn next_match(&mut self, cx: &mut Cx) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let index = self.matches[self.match_cursor % self.matches.len()];
+        self.match_cursor += 1;
+        self.select(cx, index);
+        self.fly_to_node(cx, index);
+    }
+
+    pub fn set_3d(&mut self, cx: &mut Cx, on: bool) {
+        if on == self.mode_3d || self.cam_scale <= 0.0 {
+            self.mode_3d = on;
+            self.redraw(cx);
+            return;
+        }
+        // keep looking at the same spot when switching
+        let k = self.scale_3d() as f64;
+        let tan_half = (self.orbit.fov_y.to_radians() * 0.5).tan() as f64;
+        if on {
+            let center = self.cam_off + self.view.size * 0.5 / self.cam_scale;
+            self.orbit.target = vec3f(((center.x - self.world.w * 0.5) * k) as f32, 0.0, ((center.y - self.world.h * 0.5) * k) as f32);
+            let visible = self.view.size.y / self.cam_scale * k;
+            self.orbit.distance = (visible / (2.0 * tan_half)) as f32;
+        } else {
+            let t = self.orbit.target;
+            let center = dvec2(t.x as f64 / k + self.world.w * 0.5, t.z as f64 / k + self.world.h * 0.5);
+            let visible = self.orbit.distance as f64 * 2.0 * tan_half / k;
+            self.cam_scale = self.view.size.y / visible.max(1e-9);
+            self.cam_off = center - self.view.size * 0.5 / self.cam_scale;
+        }
+        self.mode_3d = on;
+        self.flight = None;
+        self.orbit_flight = None;
+        self.redraw(cx);
+    }
+
     pub fn fit(&mut self, cx: &mut Cx) {
-        let world = self.world;
-        self.fly_to(cx, world, 1.0);
+        if self.mode_3d {
+            self.orbit_flight = Some((vec3f(0.0, 0.0, 0.0), 13.0));
+            self.frame = cx.new_next_frame();
+        } else {
+            let world = self.world;
+            self.fly_to(cx, world, 1.0);
+        }
     }
 
     fn fly_to(&mut self, cx: &mut Cx, r: R, fill: f64) {
@@ -227,6 +363,21 @@ impl CodeMap {
         let scale = (self.view.size.x / r.w).min(self.view.size.y / r.h) * fill;
         self.flight = Some((dvec2(r.x + r.w * 0.5, r.y + r.h * 0.5), scale));
         self.frame = cx.new_next_frame();
+    }
+
+    fn fly_to_node(&mut self, cx: &mut Cx, index: usize) {
+        if self.mode_3d {
+            self.fly_3d(cx, index);
+        } else {
+            let r = self.tree.nodes[index].rect;
+            self.fly_to(cx, r, 0.95);
+        }
+    }
+
+    fn select(&mut self, cx: &mut Cx, index: usize) {
+        self.selected = Some(index);
+        cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
+        self.redraw(cx);
     }
 
     fn expand(&mut self, cx: &mut Cx, index: usize) {
@@ -244,7 +395,16 @@ impl CodeMap {
         self.redraw(cx);
     }
 
-    /// Pick up finished background scans.
+    fn summary(&self) -> String {
+        let root = &self.tree.nodes[0];
+        let mut text = format!("{} files, {} lines", fmt_num(root.total_files), fmt_num(root.total_lines));
+        if let Some(h) = &self.history {
+            text.push_str(&format!(", {} commits of history", fmt_num(h.commits_read as u64)));
+        }
+        text
+    }
+
+    /// Pick up finished background work.
     fn drain(&mut self, cx: &mut Cx) {
         let Some(rx) = &self.rx else { return };
         let msgs: Vec<ScanMsg> = rx.try_iter().collect();
@@ -257,32 +417,60 @@ impl CodeMap {
                         self.tree.insert(entry);
                     }
                     self.tree.update_weights(true);
-                    let root = &self.tree.nodes[0];
-                    self.message = format!(
-                        "{} files, {} lines, scanned in {:.2}s ({})",
-                        fmt_num(root.total_files),
-                        fmt_num(root.total_lines),
+                    let text = format!(
+                        "{}, scanned in {:.2}s ({})",
+                        self.summary(),
                         secs,
                         if used_git { "ignore rules from git" } else { "no git: read .gitignore files" }
                     );
+                    self.set_status(cx, text);
                     self.needs_layout = true;
                     self.needs_fit = true;
+                    if used_git {
+                        // git history is slower than the scan, so load it separately
+                        if let Some(tx) = self.tx.clone() {
+                            let root = self.root.clone();
+                            self.pending += 1;
+                            std::thread::spawn(move || {
+                                let _ = tx.send(ScanMsg::History(history::load(&root)));
+                            });
+                        }
+                    }
                 }
                 ScanMsg::Project(Err(err), _) => {
-                    self.message = format!("Could not scan: {err}");
+                    self.set_status(cx, format!("Could not scan: {err}"));
                 }
                 ScanMsg::Expanded(path, entries) => {
                     if let Some(index) = self.tree.find(&path) {
                         let count = entries.len();
                         self.tree.graft(index, entries);
-                        self.needs_layout = true;
+                        self.after_tree_change();
                         self.selected = Some(index);
-                        self.message = format!("Read ignored {path}: {} files", fmt_num(count as u64));
+                        self.set_status(cx, format!("Read ignored {path}: {} files", fmt_num(count as u64)));
                     }
                 }
+                ScanMsg::History(Ok(history)) => {
+                    self.tree.apply_history(&history);
+                    self.history = Some(history);
+                    self.tree.compute_heat(self.color_mode);
+                    self.set_status(cx, self.summary());
+                }
+                ScanMsg::History(Err(err)) => {
+                    self.set_status(cx, format!("No git history: {err}"));
+                }
             }
-            cx.widget_action(self.uid, CodeMapAction::Status(self.message.clone()));
             self.redraw(cx);
+        }
+    }
+
+    fn after_tree_change(&mut self) {
+        self.needs_layout = true;
+        if let Some(history) = &self.history {
+            self.tree.apply_history(history);
+        }
+        self.tree.compute_heat(self.color_mode);
+        if !self.search.is_empty() {
+            self.matches = self.tree.search(&self.search);
         }
     }
 
@@ -311,6 +499,9 @@ impl CodeMap {
         if self.tree.is_empty() || self.cam_scale <= 0.0 {
             return None;
         }
+        if self.mode_3d {
+            return self.pick_3d(abs);
+        }
         let p = self.to_world(abs);
         self.tree.hit(p.x, p.y, 3.0 / self.cam_scale)
     }
@@ -337,7 +528,6 @@ impl CodeMap {
 
     fn info(&self, index: usize) -> NodeInfo {
         let n = &self.tree.nodes[index];
-        let title = n.name.clone();
         let mut details = match n.kind {
             Kind::Dir => format!(
                 "Folder\n{} files\n{} lines\n{}\n{} direct children",
@@ -362,14 +552,50 @@ impl CodeMap {
                 if loading { "Reading it now ..." } else { "Not read yet. Click it to read it." }
             ),
         };
+        if self.history.is_some() && !matches!(n.kind, Kind::Ghost { .. }) {
+            if n.commits > 0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                details.push_str(&format!(
+                    "\n\nGit: {} commits\nlast changed {}",
+                    fmt_num(n.commits as u64),
+                    fmt_age(now - n.last_change)
+                ));
+            } else {
+                details.push_str("\n\nGit: no commits in history");
+            }
+        }
         if n.ignored && !matches!(n.kind, Kind::Ghost { .. }) {
             details.push_str("\n\nMatched by .gitignore");
         }
-        NodeInfo { title, path: if n.path.is_empty() { self.root.display().to_string() } else { n.path.clone() }, details }
+        NodeInfo {
+            title: n.name.clone(),
+            path: if n.path.is_empty() { self.root.display().to_string() } else { n.path.clone() },
+            details,
+        }
+    }
+
+    fn search_active(&self) -> bool {
+        !self.search.is_empty()
+    }
+
+    /// Base color of a file for the current color mode.
+    fn file_color(&self, index: usize) -> Vec4f {
+        let node = &self.tree.nodes[index];
+        match self.color_mode {
+            ColorMode::FileType => match node.kind {
+                Kind::Binary => vec4(0.45, 0.45, 0.47, 1.0),
+                _ => hsv(ext_hue(&node.name), 0.5, 0.8),
+            },
+            _ => heat_color(node.heat),
+        }
     }
 
     fn draw_map(&mut self, cx: &mut Cx2d) {
         let view = self.view;
+        let searching = self.search_active();
         let mut quads = 0usize;
         let mut stack = vec![0usize];
         while let Some(index) = stack.pop() {
@@ -389,31 +615,36 @@ impl CodeMap {
             if quads > QUAD_BUDGET {
                 break;
             }
+            // search: things off the path to a match fade into the background
+            let fade = if searching && !node.on_path { 0.22 } else { 1.0 };
             let small = r.size.x.min(r.size.y);
             let border = if small > 8.0 { 1.0 } else { 0.0 };
             match node.kind {
                 Kind::Dir => {
                     let shade = 0.07 + 0.03 * (node.depth.min(5) as f32);
                     let color = if node.ignored { vec4(shade * 1.3, shade, shade * 0.8, 1.0) } else { vec4(shade * 0.85, shade, shade * 1.25, 1.0) };
-                    block(&mut self.draw_block, cx, r, color, vec4(0.0, 0.0, 0.0, 0.6), border, if node.ignored { 0.4 } else { 0.0 });
+                    block(&mut self.draw_block, cx, r, scale_rgb(color, fade), vec4(0.0, 0.0, 0.0, 0.6), border, if node.ignored { 0.4 } else { 0.0 });
                     quads += 1;
                     if small > 4.0 {
                         stack.extend(node.children.iter().rev());
                         let (_, head) = frame(node.rect);
-                        if head * self.cam_scale >= 13.0 && r.size.x > 50.0 {
+                        if head * self.cam_scale >= 13.0 && r.size.x > 50.0 && (!searching || node.on_path) {
                             self.labels.push(Label { rect: r, text: node.name.clone(), dim: node.ignored });
                         }
                     }
                 }
                 Kind::Text => {
-                    let hue = ext_hue(&node.name);
-                    let bg = hsv(hue, 0.35, if node.ignored { 0.10 } else { 0.13 });
-                    block(&mut self.draw_block, cx, r, bg, hsv(hue, 0.4, 0.28), border, if node.ignored { 0.3 } else { 0.0 });
+                    let base = self.file_color(index);
+                    let dark = if node.ignored { 0.12 } else { 0.17 };
+                    let bg = scale_rgb(base, dark * fade);
+                    let edge = scale_rgb(base, 0.35 * fade);
+                    block(&mut self.draw_block, cx, r, bg, edge, border, if node.ignored { 0.3 } else { 0.0 });
                     quads += 1;
-                    quads += self.draw_code_lines(cx, index, hue);
+                    quads += self.draw_code_lines(cx, index, base, fade);
                 }
                 Kind::Binary => {
-                    block(&mut self.draw_block, cx, r, vec4(0.16, 0.16, 0.17, 1.0), vec4(0.3, 0.3, 0.3, 1.0), border, 0.5);
+                    let base = self.file_color(index);
+                    block(&mut self.draw_block, cx, r, scale_rgb(base, 0.35 * fade), scale_rgb(base, 0.6 * fade), border, 0.5);
                     quads += 1;
                     if r.size.x > 60.0 && r.size.y > 18.0 {
                         self.labels.push(Label { rect: r, text: node.name.clone(), dim: true });
@@ -421,7 +652,7 @@ impl CodeMap {
                 }
                 Kind::Ghost { loading, .. } => {
                     let color = if loading { vec4(0.20, 0.17, 0.08, 1.0) } else { vec4(0.10, 0.09, 0.08, 1.0) };
-                    block(&mut self.draw_block, cx, r, color, vec4(0.45, 0.38, 0.25, 1.0), border, 1.0);
+                    block(&mut self.draw_block, cx, r, scale_rgb(color, fade), vec4(0.45, 0.38, 0.25, fade), border, 1.0);
                     quads += 1;
                     if r.size.x > 60.0 && r.size.y > 18.0 {
                         let text = if loading { format!("{} (reading...)", node.name) } else { format!("{} (ignored)", node.name) };
@@ -430,15 +661,27 @@ impl CodeMap {
                 }
             }
         }
+        // outline search matches so they pop out even when small
+        if searching {
+            for k in 0..self.matches.len().min(5000) {
+                let index = self.matches[k];
+                let r = self.to_screen(self.tree.nodes[index].rect);
+                if r.size.x >= 2.0 && self.tree.nodes[index].weight > 0.0 {
+                    block(&mut self.draw_block, cx, r, vec4(0.0, 0.0, 0.0, 0.0), vec4(1.0, 0.85, 0.2, 1.0), 2.0, 0.0);
+                }
+            }
+        }
     }
 
     /// Returns how many quads were drawn.
-    fn draw_code_lines(&mut self, cx: &mut Cx2d, index: usize, hue: f32) -> usize {
+    fn draw_code_lines(&mut self, cx: &mut Cx2d, index: usize, base: Vec4f, fade: f32) -> usize {
         let node = &self.tree.nodes[index];
         let line_px = node.line_h * self.cam_scale;
         let r_screen = self.to_screen(node.rect);
+        let searching = self.search_active();
+        let wants_label = r_screen.size.x > 60.0 && r_screen.size.y > 18.0 && (!searching || node.on_path);
         if line_px < STRIPS_FROM_PX || node.lines.is_empty() {
-            if r_screen.size.x > 60.0 && r_screen.size.y > 18.0 && self.labels.len() < LABEL_BUDGET {
+            if wants_label && self.labels.len() < LABEL_BUDGET {
                 self.labels.push(Label { rect: r_screen, text: node.name.clone(), dim: false });
             }
             return 0;
@@ -459,11 +702,14 @@ impl CodeMap {
             self.text_cache.insert(index, text.lines().map(|l| l.replace('\t', "    ")).collect());
         }
         let node = &self.tree.nodes[index];
+        let code_color = scale_rgb(mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.35), 0.85 * fade);
+        let text_color = scale_rgb(mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.75), fade);
+        let comment_color = vec4(0.30 * fade, 0.40 * fade, 0.30 * fade, 1.0);
         let mut drawn = 0;
         // only visit the columns and rows that are actually on screen
-        let first_col = (((view.pos.x - inner.pos.x) / col_px).floor().max(0.0)) as usize;
+        let first_col = ((view.pos.x - inner.pos.x) / col_px).floor().max(0.0) as usize;
         let last_col = ((((view.pos.x + view.size.x) - inner.pos.x) / col_px).ceil().max(0.0) as usize).min(cols);
-        let first_row = (((view.pos.y - inner.pos.y) / line_px).floor().max(0.0)) as usize;
+        let first_row = ((view.pos.y - inner.pos.y) / line_px).floor().max(0.0) as usize;
         let last_row = ((((view.pos.y + view.size.y) - inner.pos.y) / line_px).ceil().max(0.0) as usize).min(rows);
         if text_mode {
             self.draw_code.text_style.font_size = (line_px * 0.6) as f32;
@@ -477,11 +723,11 @@ impl CodeMap {
                 if text_mode {
                     if let Some(text) = self.text_cache.get(&index).and_then(|t| t.get(k)) {
                         let clipped: String = text.chars().take(COL_CHARS as usize).collect();
-                        self.draw_code.color = if line.comment { vec4(0.45, 0.55, 0.45, 1.0) } else { hsv(hue, 0.2, 0.85) };
+                        self.draw_code.color = if line.comment { scale_rgb(vec4(0.5, 0.65, 0.5, 1.0), fade) } else { text_color };
                         self.draw_code.draw_abs(cx, dvec2(x, y), &clipped);
                     }
                 } else if line.len > 0 {
-                    let color = if line.comment { vec4(0.30, 0.38, 0.30, 1.0) } else { hsv(hue, 0.45, 0.62) };
+                    let color = if line.comment { comment_color } else { code_color };
                     let w = (line.len as f64 * char_px).min(col_px - line.indent as f64 * char_px).max(0.5);
                     let rect = Rect {
                         pos: dvec2(x + line.indent as f64 * char_px, y + line_px * 0.18),
@@ -492,7 +738,7 @@ impl CodeMap {
                 }
             }
         }
-        if r_screen.size.x > 60.0 && r_screen.size.y > 18.0 && self.labels.len() < LABEL_BUDGET {
+        if wants_label && self.labels.len() < LABEL_BUDGET {
             self.labels.push(Label { rect: r_screen, text: node.name.clone(), dim: false });
         }
         drawn
@@ -525,6 +771,36 @@ impl CodeMap {
         self.labels = labels;
         self.labels.clear();
     }
+
+    fn handle_2d_input(&mut self, cx: &mut Cx, hit: Hit) {
+        match hit {
+            Hit::FingerMove(e) => {
+                if let Some(mut drag) = self.drag {
+                    if (e.abs - drag.start).length() > 4.0 {
+                        drag.moved = true;
+                    }
+                    if drag.moved {
+                        cx.set_cursor(MouseCursor::Grabbing);
+                        self.cam_off = drag.start_off - (e.abs - drag.start) / self.cam_scale;
+                        self.redraw(cx);
+                    }
+                    self.drag = Some(drag);
+                }
+            }
+            Hit::FingerScroll(e) => {
+                self.flight = None;
+                // zoom around the point under the mouse
+                let factor = (-e.scroll.y * 0.01).exp();
+                let anchor = self.to_world(e.abs);
+                let min_scale = (self.view.size.x / self.world.w).min(self.view.size.y / self.world.h) * 0.5;
+                self.cam_scale = (self.cam_scale * factor).clamp(min_scale, min_scale * 200_000.0);
+                self.cam_off = anchor - (e.abs - self.view.pos) / self.cam_scale;
+                self.hover = self.hit(e.abs);
+                self.redraw(cx);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Widget for CodeMap {
@@ -553,15 +829,19 @@ impl Widget for CodeMap {
         }
 
         self.labels.clear();
-        self.draw_map(cx);
-        if let Some(h) = self.hover {
-            if h < self.tree.nodes.len() {
-                self.outline(cx, h, vec4(1.0, 1.0, 1.0, 0.5), 1.5);
+        if self.mode_3d {
+            self.draw_3d(cx, rect);
+        } else {
+            self.draw_map(cx);
+            if let Some(h) = self.hover {
+                if h < self.tree.nodes.len() {
+                    self.outline(cx, h, vec4(1.0, 1.0, 1.0, 0.5), 1.5);
+                }
             }
-        }
-        if let Some(s) = self.selected {
-            if s < self.tree.nodes.len() {
-                self.outline(cx, s, vec4(0.35, 0.85, 1.0, 1.0), 2.5);
+            if let Some(s) = self.selected {
+                if s < self.tree.nodes.len() {
+                    self.outline(cx, s, vec4(0.35, 0.85, 1.0, 1.0), 2.5);
+                }
             }
         }
         self.draw_labels(cx);
@@ -573,13 +853,16 @@ impl Widget for CodeMap {
         if self.frame.is_event(event).is_some() {
             self.drain(cx);
             self.step_flight(cx);
+            self.step_orbit_flight(cx);
             if self.pending > 0 {
                 self.frame = cx.new_next_frame();
             }
         }
-        match event.hits(cx, self.area) {
+        let hit = event.hits(cx, self.area);
+        match &hit {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
                 let hover = self.hit(e.abs);
+                self.hover_abs = e.abs;
                 if hover != self.hover {
                     self.hover = hover;
                     self.redraw(cx);
@@ -592,55 +875,40 @@ impl Widget for CodeMap {
             }
             Hit::FingerDown(e) => {
                 self.flight = None;
-                self.drag = Some(Drag { start: e.abs, start_off: self.cam_off, moved: false, taps: e.tap_count });
-            }
-            Hit::FingerMove(e) => {
-                if let Some(mut drag) = self.drag {
-                    let delta = e.abs - drag.start;
-                    if delta.length() > 4.0 {
-                        drag.moved = true;
-                    }
-                    if drag.moved {
-                        cx.set_cursor(MouseCursor::Grabbing);
-                        self.cam_off = drag.start_off - delta / self.cam_scale;
-                        self.redraw(cx);
-                    }
-                    self.drag = Some(drag);
-                }
+                self.orbit_flight = None;
+                self.drag = Some(Drag {
+                    start: e.abs,
+                    last: e.abs,
+                    start_off: self.cam_off,
+                    moved: false,
+                    taps: e.tap_count,
+                    pan: !e.device.is_primary_hit() || e.modifiers.shift,
+                });
             }
             Hit::FingerUp(e) => {
                 cx.set_cursor(MouseCursor::Default);
                 if let Some(drag) = self.drag.take() {
                     if !drag.moved {
                         if let Some(index) = self.hit(e.abs) {
-                            self.selected = Some(index);
+                            self.select(cx, index);
                             if matches!(self.tree.nodes[index].kind, Kind::Ghost { .. }) {
                                 self.expand(cx, index);
                             } else if drag.taps >= 2 {
-                                let r = self.tree.nodes[index].rect;
-                                self.fly_to(cx, r, 0.95);
+                                self.fly_to_node(cx, index);
                             }
-                            cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
-                            self.redraw(cx);
                         }
                     }
                 }
             }
-            Hit::FingerScroll(e) => {
-                if self.cam_scale <= 0.0 {
-                    return;
-                }
-                self.flight = None;
-                // zoom around the point under the mouse
-                let factor = (-e.scroll.y * 0.01).exp();
-                let anchor = self.to_world(e.abs);
-                let min_scale = (self.view.size.x / self.world.w).min(self.view.size.y / self.world.h) * 0.5;
-                self.cam_scale = (self.cam_scale * factor).clamp(min_scale, min_scale * 200_000.0);
-                self.cam_off = anchor - (e.abs - self.view.pos) / self.cam_scale;
-                self.hover = self.hit(e.abs);
-                self.redraw(cx);
-            }
             _ => {}
+        }
+        if self.cam_scale <= 0.0 {
+            return;
+        }
+        if self.mode_3d {
+            self.handle_3d_input(cx, hit);
+        } else {
+            self.handle_2d_input(cx, hit);
         }
     }
 }
@@ -663,6 +931,34 @@ impl CodeMapRef {
             inner.fit(cx);
         }
     }
+    pub fn set_color_mode(&self, cx: &mut Cx, mode: ColorMode) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_color_mode(cx, mode);
+        }
+    }
+    pub fn set_search(&self, cx: &mut Cx, query: &str) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_search(cx, query);
+        }
+    }
+    pub fn next_match(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.next_match(cx);
+        }
+    }
+    pub fn set_3d(&self, cx: &mut Cx, on: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_3d(cx, on);
+        }
+    }
+}
+
+fn block(draw: &mut DrawBlock, cx: &mut Cx2d, rect: Rect, color: Vec4f, edge: Vec4f, border: f32, hatch: f32) {
+    draw.color = color;
+    draw.edge = edge;
+    draw.border = border;
+    draw.hatch = hatch;
+    draw.draw_abs(cx, rect);
 }
 
 /// A stable color per file extension, with hand-picked ones for common types.
@@ -685,12 +981,34 @@ fn ext_hue(name: &str) -> f32 {
     }
 }
 
+/// Heatmap ramp: cold blue, through magenta and orange, to hot yellow.
+/// Grey when a file has no git history.
+fn heat_color(heat: f32) -> Vec4f {
+    if heat < 0.0 {
+        return vec4(0.30, 0.30, 0.32, 1.0);
+    }
+    let stops = [(0.10, 0.22, 0.60), (0.62, 0.22, 0.62), (0.98, 0.45, 0.18), (1.0, 0.92, 0.35)];
+    let t = heat.clamp(0.0, 1.0) * 3.0;
+    let i = (t.floor() as usize).min(2);
+    let f = t - i as f32;
+    let (a, b) = (stops[i], stops[i + 1]);
+    vec4(a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f, a.2 + (b.2 - a.2) * f, 1.0)
+}
+
 fn hsv(h: f32, s: f32, v: f32) -> Vec4f {
     let f = |n: f32| {
         let k = (n + h * 6.0) % 6.0;
         v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
     };
     vec4(f(5.0), f(3.0), f(1.0), 1.0)
+}
+
+fn scale_rgb(c: Vec4f, k: f32) -> Vec4f {
+    vec4(c.x * k, c.y * k, c.z * k, c.w)
+}
+
+fn mix_rgb(a: Vec4f, b: Vec4f, t: f32) -> Vec4f {
+    vec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w)
 }
 
 pub fn fmt_num(n: u64) -> String {
@@ -714,10 +1032,13 @@ pub fn fmt_bytes(b: u64) -> String {
     }
 }
 
-fn block(draw: &mut DrawBlock, cx: &mut Cx2d, rect: Rect, color: Vec4f, edge: Vec4f, border: f32, hatch: f32) {
-    draw.color = color;
-    draw.edge = edge;
-    draw.border = border;
-    draw.hatch = hatch;
-    draw.draw_abs(cx, rect);
+fn fmt_age(secs: i64) -> String {
+    let days = secs / 86_400;
+    match days {
+        d if d < 1 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        d if d < 60 => format!("{d} days ago"),
+        d if d < 730 => format!("{} months ago", d / 30),
+        d => format!("{} years ago", d / 365),
+    }
 }

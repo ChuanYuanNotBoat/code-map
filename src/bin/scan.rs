@@ -7,6 +7,9 @@
 
 // Reuse the app's scanner and tree code by pointing at the same files.
 #[allow(dead_code)]
+#[path = "../history.rs"]
+mod history;
+#[allow(dead_code)]
 #[path = "../model.rs"]
 mod model;
 #[allow(dead_code)]
@@ -56,6 +59,30 @@ fn main() {
     for n in biggest.iter().take(12) {
         println!("  {:>10}  {:>6.1} x {:<6.1}  {}", n.total_lines, n.rect.w, n.rect.h, n.name);
     }
+
+    let started = std::time::Instant::now();
+    match history::load(&root) {
+        Ok(h) => {
+            tree.apply_history(&h);
+            let mut files: Vec<&model::Node> = tree.nodes.iter().filter(|n| n.commits > 0 && n.is_file()).collect();
+            files.sort_by_key(|n| std::cmp::Reverse(n.commits));
+            println!(
+                "git history: {} commits, {} files with history, {:.2}s. Most changed:",
+                h.commits_read,
+                files.len(),
+                started.elapsed().as_secs_f64()
+            );
+            for n in files.iter().take(5) {
+                println!("  {:>5} commits  {}", n.commits, n.path);
+            }
+            tree.compute_heat(model::ColorMode::Churn);
+            let hot = tree.nodes.iter().filter(|n| n.heat >= 0.99).count();
+            println!("  heat computed, {hot} files at the top rank");
+        }
+        Err(err) => println!("git history: {err}"),
+    }
+    let matches = tree.search("text input");
+    println!("search \"text input\": {} matches, first: {:?}", matches.len(), matches.iter().take(3).map(|&i| &tree.nodes[i].path).collect::<Vec<_>>());
 
     for rel in std::env::args().skip(2) {
         let started = std::time::Instant::now();

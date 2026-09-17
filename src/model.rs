@@ -6,6 +6,7 @@
 //! ownership rules with, and a child always has a bigger index than its
 //! parent, so walking the Vec backwards visits children before parents.
 
+use crate::history::History;
 use crate::scan::{Entry, EntryKind, Line};
 use std::collections::HashMap;
 
@@ -36,7 +37,6 @@ pub enum Kind {
 pub struct Node {
     pub name: String,
     pub path: String,
-    #[allow(dead_code)]
     pub parent: Option<usize>,
     pub children: Vec<usize>,
     pub kind: Kind,
@@ -54,11 +54,59 @@ pub struct Node {
     /// Code layout inside a file: number of columns and line height.
     pub cols: u32,
     pub line_h: f64,
+    /// Git activity: commits touching this file (or folder) and last change time.
+    pub commits: u32,
+    pub last_change: i64,
+    /// 0..1 rank for the heatmap, negative when there is no git data.
+    pub heat: f32,
+    /// Search: `lit` if this node or a folder above it matches,
+    /// `on_path` if it is lit or has a match somewhere below it.
+    pub lit: bool,
+    pub on_path: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ColorMode {
+    #[default]
+    FileType,
+    Recent,
+    Churn,
 }
 
 pub struct Tree {
     pub nodes: Vec<Node>,
     by_path: HashMap<String, usize>,
+}
+
+impl Node {
+    fn new(name: String, path: String, parent: Option<usize>, depth: u32, ignored: bool) -> Self {
+        Node {
+            name,
+            path,
+            parent,
+            children: Vec::new(),
+            kind: Kind::Dir,
+            ignored,
+            depth,
+            lines: Vec::new(),
+            bytes: 0,
+            total_lines: 0,
+            total_files: 0,
+            weight: 0.0,
+            rect: R::default(),
+            cols: 0,
+            line_h: 0.0,
+            commits: 0,
+            last_change: 0,
+            heat: -1.0,
+            lit: true,
+            on_path: true,
+        }
+    }
+
+    pub fn is_file(&self) -> bool {
+        matches!(self.kind, Kind::Text | Kind::Binary)
+    }
 }
 
 impl Default for Tree {
@@ -69,23 +117,7 @@ impl Default for Tree {
 
 impl Tree {
     pub fn new(root_name: &str) -> Self {
-        let root = Node {
-            name: root_name.to_string(),
-            path: String::new(),
-            parent: None,
-            children: Vec::new(),
-            kind: Kind::Dir,
-            ignored: false,
-            depth: 0,
-            lines: Vec::new(),
-            bytes: 0,
-            total_lines: 0,
-            total_files: 0,
-            weight: 0.0,
-            rect: R::default(),
-            cols: 0,
-            line_h: 0.0,
-        };
+        let root = Node::new(root_name.to_string(), String::new(), None, 0, false);
         Tree { nodes: vec![root], by_path: HashMap::from([(String::new(), 0)]) }
     }
 
@@ -118,25 +150,10 @@ impl Tree {
             }
             let depth = self.nodes[parent].depth + 1;
             let index = self.nodes.len();
-            self.nodes.push(Node {
-                name: part.to_string(),
-                path: path.clone(),
-                parent: Some(parent),
-                children: Vec::new(),
-                kind: Kind::Dir,
-                // a folder created on the way is ignored only if its parent is;
-                // `fill` sets the flag of the entry itself
-                ignored: self.nodes[parent].ignored,
-                depth,
-                lines: Vec::new(),
-                bytes: 0,
-                total_lines: 0,
-                total_files: 0,
-                weight: 0.0,
-                rect: R::default(),
-                cols: 0,
-                line_h: 0.0,
-            });
+            // a folder created on the way is ignored only if its parent is;
+            // `fill` sets the flag of the entry itself
+            let ignored = self.nodes[parent].ignored;
+            self.nodes.push(Node::new(part.to_string(), path.clone(), Some(parent), depth, ignored));
             self.nodes[parent].children.push(index);
             self.by_path.insert(path.clone(), index);
             if last {
@@ -255,6 +272,99 @@ impl Tree {
             }
             _ => {}
         }
+    }
+
+    /// Copy git activity onto files and add it up for folders.
+    pub fn apply_history(&mut self, history: &History) {
+        for node in &mut self.nodes {
+            let (commits, last) = history.files.get(&node.path).copied().unwrap_or((0, 0));
+            node.commits = commits;
+            node.last_change = last;
+        }
+        for i in (1..self.nodes.len()).rev() {
+            if let Some(parent) = self.nodes[i].parent {
+                let (commits, last) = (self.nodes[i].commits, self.nodes[i].last_change);
+                let p = &mut self.nodes[parent];
+                if p.kind == Kind::Dir {
+                    p.commits += commits;
+                    p.last_change = p.last_change.max(last);
+                }
+            }
+        }
+    }
+
+    /// Rank files by the chosen metric. Ranks instead of raw values spread the
+    /// colors evenly, so one file with 900 commits does not make everything else blue.
+    pub fn compute_heat(&mut self, mode: ColorMode) {
+        let mut files: Vec<(usize, i64)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.is_file() && n.commits > 0)
+            .map(|(i, n)| (i, if mode == ColorMode::Churn { n.commits as i64 } else { n.last_change }))
+            .collect();
+        for node in &mut self.nodes {
+            node.heat = -1.0;
+        }
+        if mode == ColorMode::FileType || files.is_empty() {
+            return;
+        }
+        files.sort_by_key(|f| f.1);
+        let max = (files.len() - 1).max(1) as f32;
+        let mut rank = 0;
+        for k in 0..files.len() {
+            // equal values share a rank
+            if k > 0 && files[k].1 != files[k - 1].1 {
+                rank = k;
+            }
+            self.nodes[files[k].0].heat = rank as f32 / max;
+        }
+    }
+
+    /// Mark matches for a search. Every space separated word must appear in
+    /// the path (case-insensitive). Returns matching nodes, biggest first.
+    pub fn search(&mut self, query: &str) -> Vec<usize> {
+        let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+        if words.is_empty() {
+            for node in &mut self.nodes {
+                node.lit = true;
+                node.on_path = true;
+            }
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        for i in 0..self.nodes.len() {
+            let path = self.nodes[i].path.to_lowercase();
+            let hit = i > 0 && words.iter().all(|w| path.contains(w.as_str()));
+            if hit {
+                matches.push(i);
+            }
+            let parent_lit = self.nodes[i].parent.is_some_and(|p| self.nodes[p].lit);
+            self.nodes[i].lit = hit || parent_lit;
+            self.nodes[i].on_path = self.nodes[i].lit;
+        }
+        for i in (1..self.nodes.len()).rev() {
+            if self.nodes[i].on_path {
+                if let Some(p) = self.nodes[i].parent {
+                    self.nodes[p].on_path = true;
+                }
+            }
+        }
+        // a match inside a matching folder is redundant for "fly to next match"
+        matches.retain(|&i| !self.nodes[i].parent.is_some_and(|p| self.nodes[p].lit));
+        matches.sort_by(|a, b| self.nodes[*b].weight.total_cmp(&self.nodes[*a].weight));
+        matches
+    }
+
+    /// The top-level folder a node lives in (for coloring regions in 3D).
+    pub fn top_level(&self, mut index: usize) -> usize {
+        while let Some(parent) = self.nodes[index].parent {
+            if parent == 0 {
+                return index;
+            }
+            index = parent;
+        }
+        index
     }
 
     /// The deepest laid-out node under a world point.
