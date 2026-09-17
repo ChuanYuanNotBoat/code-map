@@ -103,6 +103,11 @@ impl Frame {
         size / (depth * self.tan_half) * 0.5 * self.rect.size.y as f32
     }
 
+    /// How many pixels something of `size` world units looks at `distance` from the eye.
+    pub fn pixels_at_distance(&self, distance: f32, size: f32) -> f32 {
+        size / (distance.max(0.00001) * self.tan_half) * 0.5 * self.rect.size.y as f32
+    }
+
     /// Rough frustum test for a sphere, so we skip boxes that are off screen.
     pub fn sphere_visible(&self, c: Vec3f, radius: f32) -> bool {
         let rel = c - self.eye;

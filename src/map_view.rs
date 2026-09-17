@@ -180,6 +180,9 @@ pub struct CodeMap {
     depth_texture: Texture,
     #[rust]
     pass_ready: bool,
+    /// One draw list per file whose code is shown on its tower top in 3D.
+    #[rust]
+    code_lists: Vec<DrawList>,
 
     #[rust]
     root: PathBuf,
@@ -693,13 +696,8 @@ impl CodeMap {
         let col_px = COL_CHARS * char_px;
         let view = self.view;
         let text_mode = line_px >= TEXT_FROM_PX;
-        if text_mode && !self.text_cache.contains_key(&index) {
-            if self.text_cache.len() > 300 {
-                self.text_cache.clear();
-            }
-            let content = std::fs::read(self.root.join(&node.path)).unwrap_or_default();
-            let text = String::from_utf8_lossy(&content).into_owned();
-            self.text_cache.insert(index, text.lines().map(|l| l.replace('\t', "    ")).collect());
+        if text_mode {
+            self.ensure_text(index);
         }
         let node = &self.tree.nodes[index];
         let code_color = scale_rgb(mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.35), 0.85 * fade);
@@ -742,6 +740,19 @@ impl CodeMap {
             self.labels.push(Label { rect: r_screen, text: node.name.clone(), dim: false });
         }
         drawn
+    }
+
+    /// Load a file's text for the fully zoomed-in view (cached).
+    fn ensure_text(&mut self, index: usize) {
+        if self.text_cache.contains_key(&index) {
+            return;
+        }
+        if self.text_cache.len() > 300 {
+            self.text_cache.clear();
+        }
+        let content = std::fs::read(self.root.join(&self.tree.nodes[index].path)).unwrap_or_default();
+        let text = String::from_utf8_lossy(&content).into_owned();
+        self.text_cache.insert(index, text.lines().map(|l| l.replace('\t', "    ")).collect());
     }
 
     fn outline(&mut self, cx: &mut Cx2d, index: usize, color: Vec4f, width: f32) {

@@ -18,6 +18,22 @@ const CITY_SIZE: f32 = 10.0;
 const PLATE: f32 = 0.035;
 const CUBE_BUDGET: usize = 250_000;
 const LABELS_3D: usize = 120;
+/// At most this many files show their code on top at once (closest first).
+const CODE_PANELS: usize = 48;
+/// Caps so a zoomed-in view of huge files stays fast: text lines per file,
+/// text lines per frame, and line strips per frame.
+const PANEL_TEXT_LINES_PER_FILE: usize = 3000;
+const PANEL_TEXT_LINES: usize = 12_000;
+const PANEL_STRIPS: usize = 250_000;
+
+/// A file tower whose top is close enough to show code on it.
+struct CodePanel {
+    index: usize,
+    /// Screen pixels per line of code at this tower.
+    line_px: f32,
+    /// World position of the top face's corner (layout x/y minimum).
+    corner: Vec3f,
+}
 
 impl CodeMap {
     /// World units (2D layout) to 3D units.
@@ -97,6 +113,7 @@ impl CodeMap {
         let k = self.scale_3d();
         let (ox, oz) = (self.world.w as f32 * 0.5, self.world.h as f32 * 0.5);
         let searching = self.search_active();
+        let mut panels: Vec<CodePanel> = Vec::new();
         self.picks.clear();
         self.draw_cube.transform = Mat4f::identity();
         self.draw_cube.depth_clip = 0.0;
@@ -173,6 +190,19 @@ impl CodeMap {
             self.draw_cube.draw(cx);
             self.picks.push((index, min, max));
 
+            if node.kind == Kind::Text && !node.lines.is_empty() && px > 40.0 {
+                // measure from the closest point of the roof: using the tower's
+                // center breaks down when the camera hovers right above it
+                let roof = base + height;
+                let eye = frame.eye;
+                let nearest = vec3f(eye.x.clamp(x, x + w), roof, eye.z.clamp(z, z + d));
+                let line_px = frame.pixels_at_distance((nearest - eye).length(), node.line_h as f32 * k);
+                if line_px >= STRIPS_FROM_PX as f32 {
+                    // lift the code a hair above the roof so it doesn't flicker (z-fighting)
+                    let lift = (center - frame.eye).length() * 0.001;
+                    panels.push(CodePanel { index, line_px, corner: vec3f(x, base + height + lift, z) });
+                }
+            }
             if is_dir && px > 10.0 {
                 let top = base + height;
                 stack.extend(node.children.iter().rev().map(|&c| (c, top)));
@@ -182,6 +212,94 @@ impl CodeMap {
             }
         }
         self.draw_cube.end_many_instances(cx);
+
+        panels.sort_by(|a, b| b.line_px.total_cmp(&a.line_px));
+        panels.truncate(CODE_PANELS);
+        self.draw_code_panels(cx, panels);
+    }
+
+    /// Draw code on top of towers. Each panel is ordinary 2D drawing (the same
+    /// strips and text as the flat view) into its own draw list, and the list's
+    /// view transform matrix lays that 2D plane onto the roof in 3D.
+    /// Makepad's XR mode puts whole UI panels into 3D space the same way.
+    fn draw_code_panels(&mut self, cx: &mut Cx3d, panels: Vec<CodePanel>) {
+        let k = self.scale_3d() as f64;
+        let mut text_budget = PANEL_TEXT_LINES;
+        let mut strip_budget = PANEL_STRIPS;
+        for (slot, panel) in panels.iter().enumerate() {
+            while self.code_lists.len() <= slot {
+                self.code_lists.push(DrawList::new(cx.cx));
+            }
+            let text_mode = panel.line_px >= TEXT_FROM_PX as f32 && text_budget > 0;
+            if text_mode {
+                self.ensure_text(panel.index);
+            }
+            let node = &self.tree.nodes[panel.index];
+            // Choose local units so one line is about as many units as it has
+            // screen pixels: text is laid out at a size that stays sharp.
+            let local_line = (panel.line_px as f64).clamp(6.0, 48.0);
+            let s = node.line_h / local_line; // layout units per local unit
+            let r = node.rect;
+            let size = dvec2(r.w / s, r.h / s);
+            let sk = (s * k) as f32;
+            // column-major 4x4: local x -> world X, local y -> world Z, local z ignored
+            let matrix = Mat4f {
+                v: [sk, 0.0, 0.0, 0.0, 0.0, 0.0, sk, 0.0, 0.0, 0.0, 0.0, 0.0, panel.corner.x, panel.corner.y, panel.corner.z, 1.0],
+            };
+
+            let cx2d = &mut Cx2d::new(cx.cx);
+            let list = &mut self.code_lists[slot];
+            list.begin_always(cx2d);
+            list.set_view_transform(cx2d, &matrix);
+            cx2d.begin_root_turtle(size, Layout::flow_down());
+
+            let inner = code_inner(r);
+            let origin = dvec2((inner.x - r.x) / s, (inner.y - r.y) / s);
+            let cols = node.cols.max(1) as usize;
+            let rows = node.lines.len().div_ceil(cols);
+            let char_w = local_line * CHAR_W;
+            let col_w = COL_CHARS * char_w;
+            let base = self.file_color(panel.index);
+            let code_color = mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.35);
+            let text_color = mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.8);
+            let comment_color = vec4(0.35, 0.48, 0.35, 1.0);
+            if text_mode {
+                self.draw_code.text_style.font_size = (local_line * 0.6) as f32;
+            }
+            let lines = if text_mode { node.lines.len().min(PANEL_TEXT_LINES_PER_FILE) } else { node.lines.len().min(strip_budget) };
+            if !text_mode {
+                strip_budget -= lines;
+            }
+            for i in 0..lines {
+                let line = node.lines[i];
+                let x = origin.x + (i / rows) as f64 * col_w;
+                let y = origin.y + (i % rows) as f64 * local_line;
+                if text_mode {
+                    if text_budget == 0 {
+                        break;
+                    }
+                    if let Some(text) = self.text_cache.get(&panel.index).and_then(|t| t.get(i)) {
+                        if !text.trim().is_empty() {
+                            let clipped: String = text.chars().take(COL_CHARS as usize).collect();
+                            self.draw_code.color = if line.comment { comment_color } else { text_color };
+                            self.draw_code.draw_abs(cx2d, dvec2(x, y), &clipped);
+                            text_budget -= 1;
+                        }
+                    }
+                } else if line.len > 0 {
+                    let w = (line.len as f64 * char_w).min(col_w - line.indent as f64 * char_w).max(0.5);
+                    let rect = Rect {
+                        pos: dvec2(x + line.indent as f64 * char_w, y + local_line * 0.18),
+                        size: dvec2(w, local_line * 0.64),
+                    };
+                    let color = if line.comment { comment_color } else { code_color };
+                    block(&mut self.draw_block, cx2d, rect, color, vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+                }
+            }
+
+            cx2d.end_pass_sized_turtle();
+            self.code_lists[slot].end(cx2d);
+        }
     }
 
     /// The box under the mouse: closest hit along the ray.
