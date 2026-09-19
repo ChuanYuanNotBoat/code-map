@@ -270,64 +270,50 @@ impl App {
         let language = self.language;
         self.ui
             .text_input(cx, ids!(search))
-            .set_empty_text(cx, language.search_placeholder().to_string());
+            .set_empty_text(cx, language.search_placeholder());
         self.ui.drop_down(cx, ids!(color_mode)).set_labels(
             cx,
-            language
-                .color_modes()
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            language.color_modes().into_iter().collect(),
         );
         self.ui.drop_down(cx, ids!(detail_level)).set_labels(
             cx,
-            language
-                .detail_levels()
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            language.detail_levels().into_iter().collect(),
         );
         self.ui.drop_down(cx, ids!(language)).set_labels(
             cx,
-            Language::language_names()
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            language.language_names().into_iter().collect(),
         );
-        self.ui.button(cx, ids!(fit_button)).set_text(cx, language.fit());
+        self.ui.button(cx, ids!(fit_button)).set_text(cx, &language.fit());
         self.ui
             .check_box(cx, ids!(show_ignored))
-            .set_text(language.show_ignored());
+            .set_text(&language.show_ignored());
         self.ui
             .label(cx, ids!(inspector_heading))
-            .set_text(cx, language.inspector());
+            .set_text(cx, &language.inspector());
         self.ui
             .label(cx, ids!(custom_detail_heading))
-            .set_text(cx, language.custom_detail());
-        // SliderRef does not expose set_label, and set_text parses a numeric
-        // slider value. Patch the existing text property without touching the
-        // current numeric setting or modifying the external Makepad checkout.
+            .set_text(cx, &language.custom_detail());
+        // Pass owned strings to Makepad; a borrowed &str would require 'static.
+        // Update only the caption, never the slider value.
         let label = language.geometry_detail();
         let mut slider = self.ui.widget(cx, ids!(custom_geometry));
         script_apply_eval!(cx, slider, {text: #(label)});
 
-        // Language::index() is 0 for English and 1 for Simplified Chinese.
-        // Keep the numeric slider value intact: only patch its label property.
-        let label = if language.index() == 1 { "文字细节" } else { "Text detail" };
+        let label = language.text_detail();
         let mut slider = self.ui.widget(cx, ids!(custom_text));
         script_apply_eval!(cx, slider, {text: #(label)});
 
-        let label = if language.index() == 1 { "渲染预算 (%)" } else { "Render budget (%)" };
+        let label = language.render_budget();
         let mut slider = self.ui.widget(cx, ids!(custom_budget));
         script_apply_eval!(cx, slider, {text: #(label)});
         if !self.has_selection {
             self.ui
                 .label(cx, ids!(info_title))
-                .set_text(cx, language.select_hint());
+                .set_text(cx, &language.select_hint());
         }
         self.ui
             .label(cx, ids!(help))
-            .set_text(cx, language.help());
+            .set_text(cx, &language.help());
         self.ui.redraw(cx);
     }
 }
