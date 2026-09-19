@@ -12,6 +12,16 @@ the GPU. Inspired by Rik Arends' "Makepad Scope" demo.
 - Git heatmap: color by "Recently changed" or "Most changed" instead of file type.
 - 3D city mode: folders become districts, files become towers with their code on the roof.
 
+## Detail level
+
+Use the **Normal / High / Ultra** dropdown in the toolbar to change rendering detail
+without restarting or rescanning. Normal retains the original thresholds and budgets.
+High and Ultra lower the screen-space culling thresholds in both 2D and 3D, so
+more distant folders, towers and code strips can become visible. They also raise
+label and code-panel budgets. Rendering still has finite safety limits, and geometry
+smaller than a screen pixel may remain visually indistinguishable. High/Ultra can
+increase CPU work, memory use and label overlap on large repositories.
+
 ## Setup
 
 You need Rust (https://rustup.rs) and a Makepad checkout **next to** this repo, because

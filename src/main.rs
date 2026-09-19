@@ -12,7 +12,7 @@ mod orbit;
 mod scan;
 
 use makepad_widgets::*;
-use map_view::{CodeMapAction, CodeMapWidgetRefExt};
+use map_view::{CodeMapAction, CodeMapWidgetRefExt, DetailLevel};
 use model::ColorMode;
 use std::path::PathBuf;
 
@@ -54,6 +54,11 @@ script_mod! {
                             labels: ["File type" "Recently changed" "Most changed"]
                         }
                         three_d := CheckBox{text: "3D" active: false}
+                        detail_level := DropDown{
+                            width: 110
+                            labels: ["Normal" "High" "Ultra"]
+                            selected_item: 0
+                        }
                         fit_button := Button{text: "Fit"}
                         show_ignored := CheckBox{text: "Show ignored" active: true}
                         status := Label{
@@ -130,6 +135,14 @@ impl MatchEvent for App {
         }
         if let Some(on) = self.ui.check_box(cx, ids!(three_d)).changed(actions) {
             map.set_3d(cx, on);
+        }
+        if let Some(index) = self.ui.drop_down(cx, ids!(detail_level)).changed(actions) {
+            let level = match index {
+                1 => DetailLevel::High,
+                2 => DetailLevel::Ultra,
+                _ => DetailLevel::Normal,
+            };
+            map.set_detail_level(cx, level);
         }
         if let Some(index) = self.ui.drop_down(cx, ids!(color_mode)).changed(actions) {
             let mode = match index {

@@ -20,13 +20,33 @@ use std::{
     time::Instant,
 };
 
-/// Below this many screen pixels per line, a file is just a tinted box.
-const STRIPS_FROM_PX: f64 = 0.6;
-/// From this many pixels per line, draw the real text instead of strips.
-const TEXT_FROM_PX: f64 = 9.0;
-/// Hard cap on quads per frame, a safety net for huge projects.
-const QUAD_BUDGET: usize = 400_000;
-const LABEL_BUDGET: usize = 500;
+/// Runtime detail presets. Normal preserves the original rendering limits.
+/// Lower pixel thresholds reveal distant geometry; budgets bound CPU/GPU work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DetailLevel {
+    #[default]
+    Normal,
+    High,
+    Ultra,
+}
+
+impl DetailLevel {
+    fn pixels(self, normal: f64, high: f64, ultra: f64) -> f64 {
+        match self {
+            Self::Normal => normal,
+            Self::High => high,
+            Self::Ultra => ultra,
+        }
+    }
+
+    fn budget(self, normal: usize, high: usize, ultra: usize) -> usize {
+        match self {
+            Self::Normal => normal,
+            Self::High => high,
+            Self::Ultra => ultra,
+        }
+    }
+}
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -211,6 +231,8 @@ pub struct CodeMap {
     #[rust]
     mode_3d: bool,
     #[rust]
+    detail_level: DetailLevel,
+    #[rust]
     orbit: Orbit,
     /// Where the 3D camera is flying to: (target, distance).
     #[rust]
@@ -288,6 +310,13 @@ impl CodeMap {
         self.show_ignored = show;
         self.needs_layout = true;
         self.redraw(cx);
+    }
+
+    pub fn set_detail_level(&mut self, cx: &mut Cx, level: DetailLevel) {
+        if self.detail_level != level {
+            self.detail_level = level;
+            self.redraw(cx);
+        }
     }
 
     pub fn set_color_mode(&mut self, cx: &mut Cx, mode: ColorMode) {
@@ -599,6 +628,9 @@ impl CodeMap {
     fn draw_map(&mut self, cx: &mut Cx2d) {
         let view = self.view;
         let searching = self.search_active();
+        let quad_budget = self.detail_level.budget(400_000, 800_000, 1_200_000);
+        let min_node_px = self.detail_level.pixels(0.5, 0.2, 0.1);
+        let child_px = self.detail_level.pixels(4.0, 2.0, 0.75);
         let mut quads = 0usize;
         let mut stack = vec![0usize];
         while let Some(index) = stack.pop() {
@@ -611,11 +643,11 @@ impl CodeMap {
                 || r.pos.y > view.pos.y + view.size.y
                 || r.pos.x + r.size.x < view.pos.x
                 || r.pos.y + r.size.y < view.pos.y
-                || (r.size.x < 0.5 && r.size.y < 0.5)
+                || (r.size.x < min_node_px && r.size.y < min_node_px)
             {
                 continue;
             }
-            if quads > QUAD_BUDGET {
+            if quads > quad_budget {
                 break;
             }
             // search: things off the path to a match fade into the background
@@ -628,7 +660,7 @@ impl CodeMap {
                     let color = if node.ignored { vec4(shade * 1.3, shade, shade * 0.8, 1.0) } else { vec4(shade * 0.85, shade, shade * 1.25, 1.0) };
                     block(&mut self.draw_block, cx, r, scale_rgb(color, fade), vec4(0.0, 0.0, 0.0, 0.6), border, if node.ignored { 0.4 } else { 0.0 });
                     quads += 1;
-                    if small > 4.0 {
+                    if small > child_px {
                         stack.extend(node.children.iter().rev());
                         let (_, head) = frame(node.rect);
                         if head * self.cam_scale >= 13.0 && r.size.x > 50.0 && (!searching || node.on_path) {
@@ -682,9 +714,12 @@ impl CodeMap {
         let line_px = node.line_h * self.cam_scale;
         let r_screen = self.to_screen(node.rect);
         let searching = self.search_active();
+        let strip_px = self.detail_level.pixels(0.6, 0.35, 0.2);
+        let text_px = self.detail_level.pixels(9.0, 7.0, 6.0);
+        let label_budget = self.detail_level.budget(500, 1_000, 1_500);
         let wants_label = r_screen.size.x > 60.0 && r_screen.size.y > 18.0 && (!searching || node.on_path);
-        if line_px < STRIPS_FROM_PX || node.lines.is_empty() {
-            if wants_label && self.labels.len() < LABEL_BUDGET {
+        if line_px < strip_px || node.lines.is_empty() {
+            if wants_label && self.labels.len() < label_budget {
                 self.labels.push(Label { rect: r_screen, text: node.name.clone(), dim: false });
             }
             return 0;
@@ -695,7 +730,7 @@ impl CodeMap {
         let char_px = line_px * CHAR_W;
         let col_px = COL_CHARS * char_px;
         let view = self.view;
-        let text_mode = line_px >= TEXT_FROM_PX;
+        let text_mode = line_px >= text_px;
         if text_mode {
             self.ensure_text(index);
         }
@@ -736,7 +771,7 @@ impl CodeMap {
                 }
             }
         }
-        if wants_label && self.labels.len() < LABEL_BUDGET {
+        if wants_label && self.labels.len() < label_budget {
             self.labels.push(Label { rect: r_screen, text: node.name.clone(), dim: false });
         }
         drawn
@@ -762,7 +797,8 @@ impl CodeMap {
 
     fn draw_labels(&mut self, cx: &mut Cx2d) {
         let labels = std::mem::take(&mut self.labels);
-        for label in labels.iter().take(LABEL_BUDGET) {
+        let budget = self.detail_level.budget(500, 1_000, 1_500);
+        for label in labels.iter().take(budget) {
             let pos = dvec2(label.rect.pos.x.max(self.view.pos.x) + 4.0, label.rect.pos.y.max(self.view.pos.y) + 3.0);
             let room = label.rect.pos.x + label.rect.size.x - pos.x - 8.0;
             if room < 20.0 {
@@ -945,6 +981,11 @@ impl CodeMapRef {
     pub fn set_color_mode(&self, cx: &mut Cx, mode: ColorMode) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_color_mode(cx, mode);
+        }
+    }
+    pub fn set_detail_level(&self, cx: &mut Cx, level: DetailLevel) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_detail_level(cx, level);
         }
     }
     pub fn set_search(&self, cx: &mut Cx, query: &str) {
