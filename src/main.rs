@@ -135,6 +135,39 @@ script_mod! {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolbarDropdown {
+    ColorMode,
+    DetailLevel,
+    Language,
+}
+
+#[derive(Default)]
+struct DropdownReleaseGuard {
+    opening: Option<(ToolbarDropdown, usize, f64)>,
+}
+
+impl DropdownReleaseGuard {
+    const QUICK_RELEASE_SECS: f64 = 0.2;
+
+    fn press(&mut self, dropdown: Option<(ToolbarDropdown, usize)>, now: f64) {
+        // Every new physical press starts a fresh gesture. A press on a popup
+        // row therefore clears the opening guard and remains fully clickable.
+        self.opening = dropdown.map(|(kind, selected)| (kind, selected, now));
+    }
+
+    fn suppress_quick_release(&mut self, dropdown: ToolbarDropdown, now: f64) -> Option<usize> {
+        let Some((kind, selected, opened_at)) = self.opening else {
+            return None;
+        };
+        if kind != dropdown {
+            return None;
+        }
+        self.opening = None;
+        (now - opened_at <= Self::QUICK_RELEASE_SECS).then_some(selected)
+    }
+}
+
 #[derive(Script, ScriptHook)]
 pub struct App {
     #[live]
@@ -143,6 +176,8 @@ pub struct App {
     language: Language,
     #[rust]
     has_selection: bool,
+    #[rust]
+    dropdown_release_guard: DropdownReleaseGuard,
 }
 
 /// The folder to map: first command line argument, or the current folder.
@@ -153,6 +188,32 @@ fn project_path() -> PathBuf {
 }
 
 impl App {
+    fn toolbar_dropdown_at(&self, cx: &mut Cx, abs: DVec2) -> Option<ToolbarDropdown> {
+        [
+            (ToolbarDropdown::ColorMode, ids!(color_mode)),
+            (ToolbarDropdown::DetailLevel, ids!(detail_level)),
+            (ToolbarDropdown::Language, ids!(language)),
+        ]
+        .into_iter()
+        .find_map(|(kind, path)| {
+            self.ui
+                .widget(cx, path)
+                .area()
+                .rect(cx)
+                .contains(abs)
+                .then_some(kind)
+        })
+    }
+
+    fn dropdown_selection(&self, cx: &mut Cx, dropdown: ToolbarDropdown) -> usize {
+        let path = match dropdown {
+            ToolbarDropdown::ColorMode => ids!(color_mode),
+            ToolbarDropdown::DetailLevel => ids!(detail_level),
+            ToolbarDropdown::Language => ids!(language),
+        };
+        self.ui.drop_down(cx, path).selected_item()
+    }
+
     fn custom_detail(&self, cx: &mut Cx) -> CustomDetail {
         CustomDetail::new(
             self.ui
@@ -250,9 +311,21 @@ impl MatchEvent for App {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let map = self.ui.code_map(cx, ids!(map));
         if let Some(index) = self.ui.drop_down(cx, ids!(language)).changed(actions) {
-            self.language = Language::from_index(index);
-            self.apply_i18n(cx);
-            map.set_language(cx, self.language);
+            if let Some(previous) = self
+                .dropdown_release_guard
+                .suppress_quick_release(
+                    ToolbarDropdown::Language,
+                    cx.seconds_since_app_start(),
+                )
+            {
+                self.ui
+                    .drop_down(cx, ids!(language))
+                    .set_selected_item(cx, previous);
+            } else {
+                self.language = Language::from_index(index);
+                self.apply_i18n(cx);
+                map.set_language(cx, self.language);
+            }
         }
         if self.ui.button(cx, ids!(fit_button)).clicked(actions) {
             map.fit(cx);
@@ -264,21 +337,33 @@ impl MatchEvent for App {
             map.set_3d(cx, on);
         }
         if let Some(index) = self.ui.drop_down(cx, ids!(detail_level)).changed(actions) {
-            let level = match index {
-                1 => DetailLevel::High,
-                2 => DetailLevel::Ultra,
-                3 => DetailLevel::Custom,
-                _ => DetailLevel::Normal,
-            };
-            let custom = level == DetailLevel::Custom;
-            self.ui
-                .view(cx, ids!(custom_detail_panel))
-                .set_visible(cx, custom);
-            if custom {
-                let detail = self.custom_detail(cx);
-                map.set_custom_detail(cx, detail);
+            if let Some(previous) = self
+                .dropdown_release_guard
+                .suppress_quick_release(
+                    ToolbarDropdown::DetailLevel,
+                    cx.seconds_since_app_start(),
+                )
+            {
+                self.ui
+                    .drop_down(cx, ids!(detail_level))
+                    .set_selected_item(cx, previous);
+            } else {
+                let level = match index {
+                    1 => DetailLevel::High,
+                    2 => DetailLevel::Ultra,
+                    3 => DetailLevel::Custom,
+                    _ => DetailLevel::Normal,
+                };
+                let custom = level == DetailLevel::Custom;
+                self.ui
+                    .view(cx, ids!(custom_detail_panel))
+                    .set_visible(cx, custom);
+                if custom {
+                    let detail = self.custom_detail(cx);
+                    map.set_custom_detail(cx, detail);
+                }
+                map.set_detail_level(cx, level);
             }
-            map.set_detail_level(cx, level);
         }
         let custom_changed = self
             .ui
@@ -300,12 +385,24 @@ impl MatchEvent for App {
             map.set_custom_detail(cx, detail);
         }
         if let Some(index) = self.ui.drop_down(cx, ids!(color_mode)).changed(actions) {
-            let mode = match index {
-                1 => ColorMode::Recent,
-                2 => ColorMode::Churn,
-                _ => ColorMode::FileType,
-            };
-            map.set_color_mode(cx, mode);
+            if let Some(previous) = self
+                .dropdown_release_guard
+                .suppress_quick_release(
+                    ToolbarDropdown::ColorMode,
+                    cx.seconds_since_app_start(),
+                )
+            {
+                self.ui
+                    .drop_down(cx, ids!(color_mode))
+                    .set_selected_item(cx, previous);
+            } else {
+                let mode = match index {
+                    1 => ColorMode::Recent,
+                    2 => ColorMode::Churn,
+                    _ => ColorMode::FileType,
+                };
+                map.set_color_mode(cx, mode);
+            }
         }
         let search = self.ui.text_input(cx, ids!(search));
         if let Some(query) = search.changed(actions) {
@@ -347,34 +444,62 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        let pressed_dropdown = if let Event::MouseDown(e) = event {
+            self.toolbar_dropdown_at(cx, e.abs).map(|dropdown| {
+                let selected = self.dropdown_selection(cx, dropdown);
+                (dropdown, selected)
+            })
+        } else {
+            None
+        };
+        if matches!(event, Event::MouseDown(_)) {
+            self.dropdown_release_guard
+                .press(pressed_dropdown, cx.seconds_since_app_start());
+        }
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
         // The legacy dropdown supports the required BelowInput placement, but
         // its lazily created overlay is not part of the field-only redraw on
         // the first open. Redrawing the root after the press makes that first
         // popup visible while keeping every toolbar menu below its control.
-        if let Event::MouseDown(e) = event {
-            let over_dropdown = self
-                .ui
-                .widget(cx, ids!(color_mode))
-                .area()
-                .rect(cx)
-                .contains(e.abs)
-                || self
-                    .ui
-                    .widget(cx, ids!(detail_level))
-                    .area()
-                    .rect(cx)
-                    .contains(e.abs)
-                || self
-                    .ui
-                    .widget(cx, ids!(language))
-                    .area()
-                    .rect(cx)
-                    .contains(e.abs);
-            if over_dropdown {
-                self.ui.redraw(cx);
-            }
+        if pressed_dropdown.is_some() {
+            self.ui.redraw(cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DropdownReleaseGuard, ToolbarDropdown};
+
+    #[test]
+    fn quick_opening_release_is_suppressed() {
+        let mut guard = DropdownReleaseGuard::default();
+        guard.press(Some((ToolbarDropdown::DetailLevel, 2)), 10.0);
+        assert_eq!(
+            guard.suppress_quick_release(ToolbarDropdown::DetailLevel, 10.1),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn held_opening_release_keeps_sweep_selection() {
+        let mut guard = DropdownReleaseGuard::default();
+        guard.press(Some((ToolbarDropdown::Language, 0)), 20.0);
+        assert_eq!(
+            guard.suppress_quick_release(ToolbarDropdown::Language, 20.3),
+            None
+        );
+    }
+
+    #[test]
+    fn next_deliberate_press_clears_opening_guard() {
+        let mut guard = DropdownReleaseGuard::default();
+        guard.press(Some((ToolbarDropdown::Language, 0)), 30.0);
+        guard.press(None, 30.05);
+        assert_eq!(
+            guard.suppress_quick_release(ToolbarDropdown::Language, 30.1),
+            None
+        );
     }
 }
