@@ -79,7 +79,7 @@ impl CodeMap {
 
         // biggest folders get labels first
         label_spots.sort_by(|a: &(f32, usize, Vec3f), b| b.0.total_cmp(&a.0));
-        let label_budget = self.detail_level.budget(120, 240, 400);
+        let label_budget = self.detail_budget(120, 240, 400);
         for (px, index, point) in label_spots.into_iter().take(label_budget) {
             if let Some(p) = frame.project(point) {
                 let width = (px as f64).clamp(40.0, 260.0);
@@ -105,11 +105,11 @@ impl CodeMap {
         let k = self.scale_3d();
         let (ox, oz) = (self.world.w as f32 * 0.5, self.world.h as f32 * 0.5);
         let searching = self.search_active();
-        let cube_budget = self.detail_level.budget(250_000, 350_000, 500_000);
-        let min_px = self.detail_level.pixels(1.0, 0.35, 0.15) as f32;
-        let children_px = self.detail_level.pixels(10.0, 4.0, 1.5) as f32;
-        let roof_px = self.detail_level.pixels(40.0, 20.0, 10.0) as f32;
-        let label_px = self.detail_level.pixels(90.0, 45.0, 25.0) as f32;
+        let cube_budget = self.detail_budget(250_000, 350_000, 500_000);
+        let min_px = self.geometry_pixels(1.0, 0.35, 0.15) as f32;
+        let children_px = self.geometry_pixels(10.0, 4.0, 1.5) as f32;
+        let roof_px = self.geometry_pixels(40.0, 20.0, 10.0) as f32;
+        let label_px = self.geometry_pixels(90.0, 45.0, 25.0) as f32;
         let mut panels: Vec<CodePanel> = Vec::new();
         self.picks.clear();
         self.draw_cube.transform = Mat4f::identity();
@@ -194,7 +194,7 @@ impl CodeMap {
                 let eye = frame.eye;
                 let nearest = vec3f(eye.x.clamp(x, x + w), roof, eye.z.clamp(z, z + d));
                 let line_px = frame.pixels_at_distance((nearest - eye).length(), node.line_h as f32 * k);
-                if line_px >= self.detail_level.pixels(0.6, 0.35, 0.2) as f32 {
+                if line_px >= self.text_pixels(0.6, 0.35, 0.2) as f32 {
                     // lift the code a hair above the roof so it doesn't flicker (z-fighting)
                     let lift = (center - frame.eye).length() * 0.001;
                     panels.push(CodePanel { index, line_px, corner: vec3f(x, base + height + lift, z) });
@@ -211,7 +211,7 @@ impl CodeMap {
         self.draw_cube.end_many_instances(cx);
 
         panels.sort_by(|a, b| b.line_px.total_cmp(&a.line_px));
-        panels.truncate(self.detail_level.budget(48, 96, 160));
+        panels.truncate(self.detail_budget(48, 96, 160));
         self.draw_code_panels(cx, panels);
     }
 
@@ -221,13 +221,13 @@ impl CodeMap {
     /// Makepad's XR mode puts whole UI panels into 3D space the same way.
     fn draw_code_panels(&mut self, cx: &mut Cx3d, panels: Vec<CodePanel>) {
         let k = self.scale_3d() as f64;
-        let mut text_budget = self.detail_level.budget(12_000, 24_000, 48_000);
-        let mut strip_budget = self.detail_level.budget(250_000, 500_000, 750_000);
+        let mut text_budget = self.detail_budget(12_000, 24_000, 48_000);
+        let mut strip_budget = self.detail_budget(250_000, 500_000, 750_000);
         for (slot, panel) in panels.iter().enumerate() {
             while self.code_lists.len() <= slot {
                 self.code_lists.push(DrawList::new(cx.cx));
             }
-            let text_mode = panel.line_px >= self.detail_level.pixels(9.0, 7.0, 6.0) as f32 && text_budget > 0;
+            let text_mode = panel.line_px >= self.text_pixels(9.0, 7.0, 6.0) as f32 && text_budget > 0;
             if text_mode {
                 self.ensure_text(panel.index);
             }
@@ -263,7 +263,7 @@ impl CodeMap {
             if text_mode {
                 self.draw_code.text_style.font_size = (local_line * 0.6) as f32;
             }
-            let lines = if text_mode { node.lines.len().min(self.detail_level.budget(3_000, 6_000, 9_000)) } else { node.lines.len().min(strip_budget) };
+            let lines = if text_mode { node.lines.len().min(self.detail_budget(3_000, 6_000, 9_000)) } else { node.lines.len().min(strip_budget) };
             if !text_mode {
                 strip_budget -= lines;
             }

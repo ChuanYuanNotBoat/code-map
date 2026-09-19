@@ -6,13 +6,15 @@
 pub use makepad_widgets;
 
 mod history;
+mod i18n;
 mod map_view;
 mod model;
 mod orbit;
 mod scan;
 
 use makepad_widgets::*;
-use map_view::{CodeMapAction, CodeMapWidgetRefExt, DetailLevel};
+use i18n::Language;
+use map_view::{CodeMapAction, CodeMapWidgetRefExt, CustomDetail, DetailLevel};
 use model::ColorMode;
 use std::path::PathBuf;
 
@@ -57,7 +59,13 @@ script_mod! {
                         three_d := CheckBox{text: "3D" active: false}
                         detail_level := DropDown{
                             width: 110
-                            labels: ["Normal" "High" "Ultra"]
+                            labels: ["Normal" "High" "Ultra" "Custom"]
+                            selected_item: 0
+                            popup_menu_position: #(makepad_widgets::drop_down::PopupMenuPosition::BelowInput)
+                        }
+                        language := DropDown{
+                            width: 100
+                            labels: ["English" "简体中文"]
                             selected_item: 0
                             popup_menu_position: #(makepad_widgets::drop_down::PopupMenuPosition::BelowInput)
                         }
@@ -79,9 +87,34 @@ script_mod! {
                             padding: Inset{left: 14, right: 14, top: 14, bottom: 14}
                             show_bg: true
                             draw_bg +: {color: #x12161c}
-                            Label{
+                            inspector_heading := Label{
                                 text: "INSPECTOR"
                                 draw_text +: {color: #x5a6570 text_style +: {font_size: 8.0}}
+                            }
+                            custom_detail_panel := View{
+                                visible: false
+                                width: Fill height: Fit
+                                flow: Down spacing: 5
+                                padding: Inset{top: 4, bottom: 8}
+                                custom_detail_heading := Label{
+                                    text: "CUSTOM DETAIL"
+                                    draw_text +: {color: #x5a6570 text_style +: {font_size: 8.0}}
+                                }
+                                custom_geometry := Slider{
+                                    width: Fill
+                                    text: "Geometry detail"
+                                    min: 0 max: 100 default: 70 step: 1 precision: 0
+                                }
+                                custom_text := Slider{
+                                    width: Fill
+                                    text: "Text detail"
+                                    min: 0 max: 100 default: 70 step: 1 precision: 0
+                                }
+                                custom_budget := Slider{
+                                    width: Fill
+                                    text: "Render budget (%)"
+                                    min: 50 max: 400 default: 200 step: 10 precision: 0
+                                }
                             }
                             info_title := Label{
                                 width: Fill
@@ -91,7 +124,7 @@ script_mod! {
                             info_path := InfoLabel{text: ""}
                             info_details := InfoLabel{text: ""}
                             View{width: Fill height: Fill}
-                            InfoLabel{
+                            help := InfoLabel{
                                 text: "Scroll: zoom\nDrag: pan (2D) or orbit (3D)\nShift or right drag: pan (3D)\nClick: inspect\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
                             }
                         }
@@ -106,6 +139,10 @@ script_mod! {
 pub struct App {
     #[live]
     ui: WidgetRef,
+    #[rust]
+    language: Language,
+    #[rust]
+    has_selection: bool,
 }
 
 /// The folder to map: first command line argument, or the current folder.
@@ -115,11 +152,94 @@ fn project_path() -> PathBuf {
     path.canonicalize().unwrap_or(path)
 }
 
+impl App {
+    fn custom_detail(&self, cx: &mut Cx) -> CustomDetail {
+        CustomDetail::new(
+            self.ui
+                .slider(cx, ids!(custom_geometry))
+                .value()
+                .unwrap_or(70.0),
+            self.ui
+                .slider(cx, ids!(custom_text))
+                .value()
+                .unwrap_or(70.0),
+            self.ui
+                .slider(cx, ids!(custom_budget))
+                .value()
+                .unwrap_or(200.0),
+        )
+    }
+
+    fn apply_i18n(&mut self, cx: &mut Cx) {
+        let language = self.language;
+        self.ui
+            .text_input(cx, ids!(search))
+            .set_empty_text(cx, language.search_placeholder().to_string());
+        self.ui.drop_down(cx, ids!(color_mode)).set_labels(
+            cx,
+            language
+                .color_modes()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        self.ui.drop_down(cx, ids!(detail_level)).set_labels(
+            cx,
+            language
+                .detail_levels()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        self.ui.drop_down(cx, ids!(language)).set_labels(
+            cx,
+            Language::language_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        self.ui.button(cx, ids!(fit_button)).set_text(cx, language.fit());
+        self.ui
+            .check_box(cx, ids!(show_ignored))
+            .set_text(language.show_ignored());
+        self.ui
+            .label(cx, ids!(inspector_heading))
+            .set_text(cx, language.inspector());
+        self.ui
+            .label(cx, ids!(custom_detail_heading))
+            .set_text(cx, language.custom_detail());
+        self.ui
+            .widget(cx, ids!(custom_geometry))
+            .set_text(cx, language.geometry_detail());
+        self.ui
+            .widget(cx, ids!(custom_text))
+            .set_text(cx, language.text_detail());
+        self.ui
+            .widget(cx, ids!(custom_budget))
+            .set_text(cx, language.render_budget());
+        if !self.has_selection {
+            self.ui
+                .label(cx, ids!(info_title))
+                .set_text(cx, language.select_hint());
+        }
+        self.ui
+            .label(cx, ids!(help))
+            .set_text(cx, language.help());
+        self.ui.redraw(cx);
+    }
+}
+
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
+        self.language = Language::detect();
+        self.ui
+            .drop_down(cx, ids!(language))
+            .set_selected_item(cx, self.language.index());
+        self.apply_i18n(cx);
         let path = project_path();
         self.ui.label(cx, ids!(title)).set_text(cx, &format!("Code Map: {}", path.display()));
         let map = self.ui.code_map(cx, ids!(map));
+        map.set_language(cx, self.language);
         map.open(cx, path);
         if std::env::args().any(|a| a == "--3d") {
             self.ui.check_box(cx, ids!(three_d)).set_active(cx, true, Animate::No);
@@ -129,6 +249,11 @@ impl MatchEvent for App {
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let map = self.ui.code_map(cx, ids!(map));
+        if let Some(index) = self.ui.drop_down(cx, ids!(language)).changed(actions) {
+            self.language = Language::from_index(index);
+            self.apply_i18n(cx);
+            map.set_language(cx, self.language);
+        }
         if self.ui.button(cx, ids!(fit_button)).clicked(actions) {
             map.fit(cx);
         }
@@ -142,9 +267,37 @@ impl MatchEvent for App {
             let level = match index {
                 1 => DetailLevel::High,
                 2 => DetailLevel::Ultra,
+                3 => DetailLevel::Custom,
                 _ => DetailLevel::Normal,
             };
+            let custom = level == DetailLevel::Custom;
+            self.ui
+                .view(cx, ids!(custom_detail_panel))
+                .set_visible(cx, custom);
+            if custom {
+                let detail = self.custom_detail(cx);
+                map.set_custom_detail(cx, detail);
+            }
             map.set_detail_level(cx, level);
+        }
+        let custom_changed = self
+            .ui
+            .slider(cx, ids!(custom_geometry))
+            .slided(actions)
+            .is_some()
+            || self
+                .ui
+                .slider(cx, ids!(custom_text))
+                .slided(actions)
+                .is_some()
+            || self
+                .ui
+                .slider(cx, ids!(custom_budget))
+                .slided(actions)
+                .is_some();
+        if custom_changed {
+            let detail = self.custom_detail(cx);
+            map.set_custom_detail(cx, detail);
         }
         if let Some(index) = self.ui.drop_down(cx, ids!(color_mode)).changed(actions) {
             let mode = match index {
@@ -175,6 +328,7 @@ impl MatchEvent for App {
             match wa.cast::<CodeMapAction>() {
                 CodeMapAction::Status(text) => self.ui.label(cx, ids!(status)).set_text(cx, &text),
                 CodeMapAction::Selected(info) => {
+                    self.has_selection = true;
                     self.ui.label(cx, ids!(info_title)).set_text(cx, &info.title);
                     self.ui.label(cx, ids!(info_path)).set_text(cx, &info.path);
                     self.ui.label(cx, ids!(info_details)).set_text(cx, &info.details);
