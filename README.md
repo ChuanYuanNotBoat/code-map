@@ -52,10 +52,11 @@ changes it at runtime. `CODE_MAP_LANG=zh-CN` or `--lang=zh-CN` overrides detecti
 
 ## Setup
 
-Install [Rust](https://rustup.rs) and clone this fork alongside Makepad. The current
-`Cargo.toml` references `../makepad/widgets` and several Makepad crates by local path,
-so a sibling Makepad checkout is still required. This repository does not contain or
-provide manual patch files; the Code Map UI changes are tracked in its Rust source.
+Install [Rust](https://rustup.rs) and clone this fork alongside Makepad. As in the original
+project, `Cargo.toml` references `../makepad/widgets` and several Makepad crates by local path.
+The Code Map fixes, including dropdown handling and slider label updates, are committed in
+this repository's Rust source. **No separate Code Map patch file or manual patch step is needed.**
+The sibling Makepad checkout is an original project dependency, not a patch file.
 
 ```sh
 mkdir makepad-demo && cd makepad-demo
@@ -67,11 +68,10 @@ cd code-map
 
 The Makepad commit above is the version pinned by the original setup instructions.
 Makepad's API changes quickly, so other versions may require compatibility work.
-The Rust source in this repository does not include changes made to an individual
-contributor's `../makepad` working tree. A clean checkout of this dependency has not
-been verified across platforms: if it fails, please report the failure and fix the
-tracked code or pin a reproducible upstream dependency rather than relying on an
-unpublished local patch.
+This repository does not include changes made only in a contributor's `../makepad`
+working tree, nor does its setup ask you to apply unpublished Makepad patches.
+A fresh-checkout GUI regression test is still useful; please report any differences
+between a clean dependency checkout and an existing development environment.
 
 Before contributing, run:
 
