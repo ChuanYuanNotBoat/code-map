@@ -12,6 +12,25 @@ the GPU. Inspired by Rik Arends' "Makepad Scope" demo.
 - Git heatmap: color by "Recently changed" or "Most changed" instead of file type.
 - 3D city mode: folders become districts, files become towers with their code on the roof.
 
+## Detail level
+
+Use the **Normal / High / Ultra / Custom** dropdown in the toolbar to change rendering detail
+without restarting or rescanning. Normal retains the original thresholds and budgets.
+High and Ultra lower the screen-space culling thresholds in both 2D and 3D, so
+more distant folders, towers and code strips can become visible. They also raise
+label and code-panel budgets. Custom exposes geometry detail, text detail and the
+rendering budget in the inspector. Changes apply immediately. Rendering still has
+finite safety limits, and geometry smaller than a screen pixel may remain visually
+indistinguishable. Higher settings can increase CPU work, memory use and label overlap
+on large repositories.
+
+## Language
+
+The UI supports English and Simplified Chinese. It starts with the system language when
+supported, and the language dropdown in the toolbar switches at runtime. For scripts or
+launchers, override detection with `CODE_MAP_LANG=zh-CN` or `--lang=zh-CN` (use `en` for
+English).
+
 ## Setup
 
 You need Rust (https://rustup.rs) and a Makepad checkout **next to** this repo, because
@@ -62,6 +81,7 @@ cargo run --release --bin scan -- /path/to/some/project [ignored/path ...]
 | File | What it does |
 | --- | --- |
 | `src/main.rs` | App shell: window, toolbar and inspector written in Makepad's Splash DSL |
+| `src/i18n.rs` | Language detection and all translatable user-facing text |
 | `src/scan.rs` | Reads the project from disk, asks git which files are ignored, summarizes every line |
 | `src/model.rs` | Treemap layout and colors |
 | `src/history.rs` | Reads `git log` for the heatmap modes |
