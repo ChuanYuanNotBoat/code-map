@@ -144,27 +144,50 @@ enum ToolbarDropdown {
 
 #[derive(Default)]
 struct DropdownReleaseGuard {
-    opening: Option<(ToolbarDropdown, usize, f64)>,
+    opening: Option<(ToolbarDropdown, usize, f64, DVec2)>,
+    // Backstop for sweep capture transferred to a popup row during MouseMove.
+    // In that case redirecting MouseUp alone cannot stop the row's action.
+    quick_selection: Option<(ToolbarDropdown, usize)>,
 }
 
 impl DropdownReleaseGuard {
     const QUICK_RELEASE_SECS: f64 = 0.2;
 
-    fn press(&mut self, dropdown: Option<(ToolbarDropdown, usize)>, now: f64) {
-        // Every new physical press starts a fresh gesture. A press on a popup
-        // row therefore clears the opening guard and remains fully clickable.
-        self.opening = dropdown.map(|(kind, selected)| (kind, selected, now));
+    fn press(
+        &mut self,
+        dropdown: Option<(ToolbarDropdown, usize)>,
+        now: f64,
+        abs: DVec2,
+    ) {
+        // A new physical press starts a separate gesture, including clicks
+        // on popup rows, and must never be debounced as part of opening.
+        self.quick_selection = None;
+        self.opening = dropdown.map(|(kind, selected)| (kind, selected, now, abs));
     }
 
-    fn suppress_quick_release(&mut self, dropdown: ToolbarDropdown, now: f64) -> Option<usize> {
-        let Some((kind, selected, opened_at)) = self.opening else {
-            return None;
-        };
-        if kind != dropdown {
-            return None;
+    fn quick_release_origin(&mut self, now: f64) -> Option<DVec2> {
+        let (kind, selected, opened_at, origin) = self.opening.take()?;
+        if now >= opened_at && now - opened_at < Self::QUICK_RELEASE_SECS {
+            // Prefer to prevent accidental selection before widget dispatch.
+            // If MouseMove already transferred capture to an item, the item
+            // can still emit Select on MouseUp, so retain a fallback as well.
+            self.quick_selection = Some((kind, selected));
+            Some(origin)
+        } else {
+            None
         }
-        self.opening = None;
-        (now - opened_at <= Self::QUICK_RELEASE_SECS).then_some(selected)
+    }
+
+    fn take_accidental_selection(&mut self, kind: ToolbarDropdown) -> Option<usize> {
+        if self.quick_selection.map(|(pending, _)| pending) == Some(kind) {
+            self.quick_selection.take().map(|(_, selected)| selected)
+        } else {
+            None
+        }
+    }
+
+    fn clear_pending(&mut self) {
+        self.quick_selection = None;
     }
 }
 
@@ -178,6 +201,9 @@ pub struct App {
     has_selection: bool,
     #[rust]
     dropdown_release_guard: DropdownReleaseGuard,
+    // A newly opened popup may create its rows during its first draw.
+    #[rust]
+    dropdown_redraws_remaining: u8,
 }
 
 /// The folder to map: first command line argument, or the current folder.
@@ -188,6 +214,23 @@ fn project_path() -> PathBuf {
 }
 
 impl App {
+    fn restore_open_dropdown(&mut self, cx: &mut Cx, kind: ToolbarDropdown, selected: usize) {
+        let path = match kind {
+            ToolbarDropdown::ColorMode => ids!(color_mode),
+            ToolbarDropdown::DetailLevel => ids!(detail_level),
+            ToolbarDropdown::Language => ids!(language),
+        };
+        let dropdown = self.ui.drop_down(cx, path);
+        dropdown.set_selected_item(cx, selected);
+        if let Some(mut inner) = dropdown.borrow_mut() {
+            // DropDown has already closed the popup when it emits Select.
+            // Restore its open state as well as the selection.
+            inner.set_active(cx);
+        };
+        self.dropdown_redraws_remaining = 1;
+        cx.redraw_all();
+    }
+
     fn toolbar_dropdown_at(&self, cx: &mut Cx, abs: DVec2) -> Option<ToolbarDropdown> {
         [
             (ToolbarDropdown::ColorMode, ids!(color_mode)),
@@ -205,14 +248,6 @@ impl App {
         })
     }
 
-    fn dropdown_selection(&self, cx: &mut Cx, dropdown: ToolbarDropdown) -> usize {
-        let path = match dropdown {
-            ToolbarDropdown::ColorMode => ids!(color_mode),
-            ToolbarDropdown::DetailLevel => ids!(detail_level),
-            ToolbarDropdown::Language => ids!(language),
-        };
-        self.ui.drop_down(cx, path).selected_item()
-    }
 
     fn custom_detail(&self, cx: &mut Cx) -> CustomDetail {
         CustomDetail::new(
@@ -269,15 +304,22 @@ impl App {
         self.ui
             .label(cx, ids!(custom_detail_heading))
             .set_text(cx, language.custom_detail());
-        self.ui
-            .widget(cx, ids!(custom_geometry))
-            .set_text(cx, language.geometry_detail());
-        self.ui
-            .widget(cx, ids!(custom_text))
-            .set_text(cx, language.text_detail());
-        self.ui
-            .widget(cx, ids!(custom_budget))
-            .set_text(cx, language.render_budget());
+        // SliderRef does not expose set_label, and set_text parses a numeric
+        // slider value. Patch the existing text property without touching the
+        // current numeric setting or modifying the external Makepad checkout.
+        let label = language.geometry_detail();
+        let mut slider = self.ui.widget(cx, ids!(custom_geometry));
+        script_apply_eval!(cx, slider, {text: #(label)});
+
+        // Language::index() is 0 for English and 1 for Simplified Chinese.
+        // Keep the numeric slider value intact: only patch its label property.
+        let label = if language.index() == 1 { "文字细节" } else { "Text detail" };
+        let mut slider = self.ui.widget(cx, ids!(custom_text));
+        script_apply_eval!(cx, slider, {text: #(label)});
+
+        let label = if language.index() == 1 { "渲染预算 (%)" } else { "Render budget (%)" };
+        let mut slider = self.ui.widget(cx, ids!(custom_budget));
+        script_apply_eval!(cx, slider, {text: #(label)});
         if !self.has_selection {
             self.ui
                 .label(cx, ids!(info_title))
@@ -311,16 +353,10 @@ impl MatchEvent for App {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let map = self.ui.code_map(cx, ids!(map));
         if let Some(index) = self.ui.drop_down(cx, ids!(language)).changed(actions) {
-            if let Some(previous) = self
-                .dropdown_release_guard
-                .suppress_quick_release(
-                    ToolbarDropdown::Language,
-                    cx.seconds_since_app_start(),
-                )
+            if let Some(selected) = self.dropdown_release_guard
+                .take_accidental_selection(ToolbarDropdown::Language)
             {
-                self.ui
-                    .drop_down(cx, ids!(language))
-                    .set_selected_item(cx, previous);
+                self.restore_open_dropdown(cx, ToolbarDropdown::Language, selected);
             } else {
                 self.language = Language::from_index(index);
                 self.apply_i18n(cx);
@@ -337,16 +373,10 @@ impl MatchEvent for App {
             map.set_3d(cx, on);
         }
         if let Some(index) = self.ui.drop_down(cx, ids!(detail_level)).changed(actions) {
-            if let Some(previous) = self
-                .dropdown_release_guard
-                .suppress_quick_release(
-                    ToolbarDropdown::DetailLevel,
-                    cx.seconds_since_app_start(),
-                )
+            if let Some(selected) = self.dropdown_release_guard
+                .take_accidental_selection(ToolbarDropdown::DetailLevel)
             {
-                self.ui
-                    .drop_down(cx, ids!(detail_level))
-                    .set_selected_item(cx, previous);
+                self.restore_open_dropdown(cx, ToolbarDropdown::DetailLevel, selected);
             } else {
                 let level = match index {
                     1 => DetailLevel::High,
@@ -385,16 +415,10 @@ impl MatchEvent for App {
             map.set_custom_detail(cx, detail);
         }
         if let Some(index) = self.ui.drop_down(cx, ids!(color_mode)).changed(actions) {
-            if let Some(previous) = self
-                .dropdown_release_guard
-                .suppress_quick_release(
-                    ToolbarDropdown::ColorMode,
-                    cx.seconds_since_app_start(),
-                )
+            if let Some(selected) = self.dropdown_release_guard
+                .take_accidental_selection(ToolbarDropdown::ColorMode)
             {
-                self.ui
-                    .drop_down(cx, ids!(color_mode))
-                    .set_selected_item(cx, previous);
+                self.restore_open_dropdown(cx, ToolbarDropdown::ColorMode, selected);
             } else {
                 let mode = match index {
                     1 => ColorMode::Recent,
@@ -444,26 +468,64 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
-        let pressed_dropdown = if let Event::MouseDown(e) = event {
-            self.toolbar_dropdown_at(cx, e.abs).map(|dropdown| {
-                let selected = self.dropdown_selection(cx, dropdown);
-                (dropdown, selected)
-            })
+        // The library supports sweep-selection: a release over a newly opened
+        // row selects it immediately and closes the menu. For a quick opening
+        // gesture, deliver MouseUp at its original toolbar position instead.
+        // The release still reaches the widget, so mouse capture/hover can end
+        // normally. A held drag (>= 200 ms) or a second click is not changed.
+        let safe_release = if let Event::MouseUp(up) = event {
+            if up.button.is_primary() {
+                self.dropdown_release_guard
+                    .quick_release_origin(cx.seconds_since_app_start())
+                    .map(|origin| {
+                        let mut up = up.clone();
+                        up.abs = origin;
+                        Event::MouseUp(up)
+                    })
+            } else {
+                None
+            }
         } else {
             None
         };
-        if matches!(event, Event::MouseDown(_)) {
-            self.dropdown_release_guard
-                .press(pressed_dropdown, cx.seconds_since_app_start());
+
+        if matches!(event, Event::KeyDown(_)) {
+            // A later keyboard selection is unrelated to the opening release.
+            self.dropdown_release_guard.clear_pending();
         }
         self.match_event(cx, event);
-        self.ui.handle_event(cx, event, &mut Scope::empty());
-        // The legacy dropdown supports the required BelowInput placement, but
-        // its lazily created overlay is not part of the field-only redraw on
-        // the first open. Redrawing the root after the press makes that first
-        // popup visible while keeping every toolbar menu below its control.
-        if pressed_dropdown.is_some() {
-            self.ui.redraw(cx);
+        self.ui.handle_event(cx, safe_release.as_ref().unwrap_or(event), &mut Scope::empty());
+
+        if let Event::MouseDown(down) = event {
+            let pressed_dropdown = if down.button.is_primary() {
+                self.toolbar_dropdown_at(cx, down.abs).map(|kind| {
+                    let path = match kind {
+                        ToolbarDropdown::ColorMode => ids!(color_mode),
+                        ToolbarDropdown::DetailLevel => ids!(detail_level),
+                        ToolbarDropdown::Language => ids!(language),
+                    };
+                    (kind, self.ui.drop_down(cx, path).selected_item())
+                })
+            } else {
+                None
+            };
+            self.dropdown_release_guard.press(
+                pressed_dropdown,
+                cx.seconds_since_app_start(),
+                down.abs,
+            );
+
+            if pressed_dropdown.is_some() {
+                // Ask Makepad to redraw the popup pass, not just the root UI.
+                // First-use menu rows can be constructed on the first draw.
+                self.dropdown_redraws_remaining = 1;
+                cx.redraw_all();
+            }
+        } else if matches!(event, Event::Draw(_)) && self.dropdown_redraws_remaining > 0 {
+            // Paint the rows constructed by the first draw; bounded to avoid
+            // a redraw loop. No changes to the Makepad dependency required.
+            self.dropdown_redraws_remaining -= 1;
+            cx.redraw_all();
         }
     }
 }
@@ -471,35 +533,66 @@ impl AppMain for App {
 #[cfg(test)]
 mod tests {
     use super::{DropdownReleaseGuard, ToolbarDropdown};
+    use makepad_widgets::dvec2;
 
     #[test]
-    fn quick_opening_release_is_suppressed() {
+    fn quick_opening_release_is_routed_to_the_field() {
         let mut guard = DropdownReleaseGuard::default();
-        guard.press(Some((ToolbarDropdown::DetailLevel, 2)), 10.0);
-        assert_eq!(
-            guard.suppress_quick_release(ToolbarDropdown::DetailLevel, 10.1),
-            Some(2)
-        );
+        let original = dvec2(80.0, 25.0);
+        guard.press(Some((ToolbarDropdown::DetailLevel, 2)), 10.0, original);
+        assert_eq!(guard.quick_release_origin(10.1), Some(original));
+        assert_eq!(guard.take_accidental_selection(ToolbarDropdown::DetailLevel), Some(2));
+        assert_eq!(guard.take_accidental_selection(ToolbarDropdown::DetailLevel), None);
+        assert_eq!(guard.quick_release_origin(10.15), None);
     }
 
     #[test]
     fn held_opening_release_keeps_sweep_selection() {
         let mut guard = DropdownReleaseGuard::default();
-        guard.press(Some((ToolbarDropdown::Language, 0)), 20.0);
-        assert_eq!(
-            guard.suppress_quick_release(ToolbarDropdown::Language, 20.3),
-            None
-        );
+        guard.press(Some((ToolbarDropdown::Language, 1)), 20.0, dvec2(80.0, 25.0));
+        assert_eq!(guard.quick_release_origin(20.3), None);
+        assert_eq!(guard.take_accidental_selection(ToolbarDropdown::Language), None);
     }
 
     #[test]
-    fn next_deliberate_press_clears_opening_guard() {
+    fn second_click_on_popup_row_is_not_redirected() {
         let mut guard = DropdownReleaseGuard::default();
-        guard.press(Some((ToolbarDropdown::Language, 0)), 30.0);
-        guard.press(None, 30.05);
-        assert_eq!(
-            guard.suppress_quick_release(ToolbarDropdown::Language, 30.1),
-            None
-        );
+        guard.press(Some((ToolbarDropdown::Language, 0)), 30.0, dvec2(80.0, 25.0));
+        guard.press(None, 30.05, dvec2(80.0, 65.0));
+        assert_eq!(guard.quick_release_origin(30.1), None);
+        assert_eq!(guard.take_accidental_selection(ToolbarDropdown::Language), None);
+    }
+
+    #[test]
+    fn no_redirect_without_opening_press() {
+        let mut guard = DropdownReleaseGuard::default();
+        guard.press(None, 40.0, dvec2(80.0, 25.0));
+        assert_eq!(guard.quick_release_origin(40.1), None);
+    }
+
+    #[test]
+    fn release_before_press_time_is_not_redirected() {
+        let mut guard = DropdownReleaseGuard::default();
+        guard.press(Some((ToolbarDropdown::ColorMode, 1)), 50.0, dvec2(80.0, 25.0));
+        assert_eq!(guard.quick_release_origin(49.9), None);
+    }
+
+    #[test]
+    fn rapid_move_capture_fallback_only_applies_to_opening_menu() {
+        let mut guard = DropdownReleaseGuard::default();
+        guard.press(Some((ToolbarDropdown::ColorMode, 2)), 60.0, dvec2(80.0, 25.0));
+        assert_eq!(guard.quick_release_origin(60.1), Some(dvec2(80.0, 25.0)));
+        assert_eq!(guard.take_accidental_selection(ToolbarDropdown::Language), None);
+        assert_eq!(guard.take_accidental_selection(ToolbarDropdown::ColorMode), Some(2));
+        assert_eq!(guard.take_accidental_selection(ToolbarDropdown::ColorMode), None);
+    }
+
+    #[test]
+    fn keyboard_action_clears_stale_opening_suppression() {
+        let mut guard = DropdownReleaseGuard::default();
+        guard.press(Some((ToolbarDropdown::DetailLevel, 1)), 70.0, dvec2(80.0, 25.0));
+        assert!(guard.quick_release_origin(70.1).is_some());
+        guard.clear_pending();
+        assert_eq!(guard.take_accidental_selection(ToolbarDropdown::DetailLevel), None);
     }
 }

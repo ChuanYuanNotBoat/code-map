@@ -31,6 +31,17 @@ supported, and the language dropdown in the toolbar switches at runtime. For scr
 launchers, override detection with `CODE_MAP_LANG=zh-CN` or `--lang=zh-CN` (use `en` for
 English).
 
+## Dropdown / locale fix (pinned Makepad checkout)
+
+If upgrading from the previous dropdown fix, apply the supplied
+`code-map-v2.patch` to Code Map (or use the full source archive). **Also apply**
+`patches/makepad-dropdown-v2.patch` to the sibling `../makepad` checkout at
+the commit pinned below; Code Map's `Cargo.toml` uses that local dependency.
+The Makepad fix invalidates the popup's **own overlay draw list** on opening,
+schedules one redraw after first-use menu-item creation, and adds `set_label`
+for Slider captions without changing slider values. Do not apply patches twice.
+Build and visually check the first opening of each dropdown after patching.
+
 ## Setup
 
 You need Rust (https://rustup.rs) and a Makepad checkout **next to** this repo, because

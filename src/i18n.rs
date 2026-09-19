@@ -411,6 +411,16 @@ mod tests {
     }
 
     #[test]
+    fn custom_detail_captions_have_both_locales() {
+        assert_eq!(Language::English.geometry_detail(), "Geometry detail");
+        assert_eq!(Language::English.text_detail(), "Text detail");
+        assert_eq!(Language::English.render_budget(), "Render budget (%)");
+        assert_eq!(Language::SimplifiedChinese.geometry_detail(), "几何细节");
+        assert_eq!(Language::SimplifiedChinese.text_detail(), "文字细节");
+        assert_eq!(Language::SimplifiedChinese.render_budget(), "渲染预算（%）");
+    }
+
+    #[test]
     fn localizes_compound_status_text() {
         assert_eq!(
             Language::English.summary("12", "345", Some("8")),
