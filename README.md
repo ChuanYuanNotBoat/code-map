@@ -26,10 +26,29 @@ on large repositories.
 
 ## Language
 
-The UI supports English and Simplified Chinese. It starts with the system language when
-supported, and the language dropdown in the toolbar switches at runtime. For scripts or
-launchers, override detection with `CODE_MAP_LANG=zh-CN` or `--lang=zh-CN` (use `en` for
-English).
+The UI supports English and Simplified Chinese using **Fluent** (`fluent-bundle`).
+Translations are external UTF-8 files in `locales/en-US/main.ftl` and
+`locales/zh-CN/main.ftl`. Keep the files alongside the distributed executable:
+
+```text
+code-map.exe
+locales/
+  en-US/main.ftl
+  zh-CN/main.ftl
+```
+
+The app loads the translation catalogs on first use and caches them. Editing an `.ftl`
+file takes effect after restarting the app; no recompilation is necessary. For development,
+`cargo run` finds `locales/` in the current working directory or the project source tree.
+For release, place `locales/` **next to the executable**, or set
+`CODE_MAP_LOCALES_DIR` to the complete path of the `locales` directory. If a translation
+is missing or invalid, the app logs a diagnostic to stderr and falls back to English;
+if the English translation cannot be loaded, missing message IDs are shown as a last resort.
+
+The initial language follows the system language when supported; the toolbar selector
+changes it at runtime. `CODE_MAP_LANG=zh-CN` or `--lang=zh-CN` overrides detection
+(use `en` for English). Keep translation IDs consistent in both `.ftl` files. The
+`src/i18n.rs` adapter retains the existing `Language` API and handles dynamic formatting.
 
 ## Dropdown / locale fix (pinned Makepad checkout)
 
@@ -92,7 +111,8 @@ cargo run --release --bin scan -- /path/to/some/project [ignored/path ...]
 | File | What it does |
 | --- | --- |
 | `src/main.rs` | App shell: window, toolbar and inspector written in Makepad's Splash DSL |
-| `src/i18n.rs` | Language detection and all translatable user-facing text |
+| `src/i18n.rs` | Fluent loading, cached lookup, English fallback, language detection and formatting |
+| `locales/*/main.ftl` | Editable English and Simplified Chinese translation resources |
 | `src/scan.rs` | Reads the project from disk, asks git which files are ignored, summarizes every line |
 | `src/model.rs` | Treemap layout and colors |
 | `src/history.rs` | Reads `git log` for the heatmap modes |

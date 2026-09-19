@@ -699,11 +699,11 @@ impl CodeMap {
                     &self.language.age(now - n.last_change),
                 ));
             } else {
-                details.push_str(self.language.no_commits());
+                details.push_str(&self.language.no_commits());
             }
         }
         if n.ignored && !matches!(n.kind, Kind::Ghost { .. }) {
-            details.push_str(self.language.matched_gitignore());
+            details.push_str(&self.language.matched_gitignore());
         }
         NodeInfo {
             title: n.name.clone(),
