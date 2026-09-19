@@ -51,20 +51,23 @@ script_mod! {
                             width: 220 height: 28
                             empty_text: "Search files and folders"
                         }
-                        color_mode := DropDown2{
+                        color_mode := DropDown{
                             width: 150
                             labels: ["File type" "Recently changed" "Most changed"]
+                            popup_menu_position: #(makepad_widgets::drop_down::PopupMenuPosition::BelowInput)
                         }
                         three_d := CheckBox{text: "3D" active: false}
-                        detail_level := DropDown2{
+                        detail_level := DropDown{
                             width: 110
                             labels: ["Normal" "High" "Ultra" "Custom"]
                             selected_item: 0
+                            popup_menu_position: #(makepad_widgets::drop_down::PopupMenuPosition::BelowInput)
                         }
-                        language := DropDown2{
+                        language := DropDown{
                             width: 100
                             labels: ["English" "简体中文"]
                             selected_item: 0
+                            popup_menu_position: #(makepad_widgets::drop_down::PopupMenuPosition::BelowInput)
                         }
                         fit_button := Button{text: "Fit"}
                         show_ignored := CheckBox{text: "Show ignored" active: true}
@@ -172,7 +175,7 @@ impl App {
         self.ui
             .text_input(cx, ids!(search))
             .set_empty_text(cx, language.search_placeholder().to_string());
-        self.ui.drop_down2(cx, ids!(color_mode)).set_labels(
+        self.ui.drop_down(cx, ids!(color_mode)).set_labels(
             cx,
             language
                 .color_modes()
@@ -180,7 +183,7 @@ impl App {
                 .map(str::to_string)
                 .collect(),
         );
-        self.ui.drop_down2(cx, ids!(detail_level)).set_labels(
+        self.ui.drop_down(cx, ids!(detail_level)).set_labels(
             cx,
             language
                 .detail_levels()
@@ -188,7 +191,7 @@ impl App {
                 .map(str::to_string)
                 .collect(),
         );
-        self.ui.drop_down2(cx, ids!(language)).set_labels(
+        self.ui.drop_down(cx, ids!(language)).set_labels(
             cx,
             Language::language_names()
                 .into_iter()
@@ -230,7 +233,7 @@ impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         self.language = Language::detect();
         self.ui
-            .drop_down2(cx, ids!(language))
+            .drop_down(cx, ids!(language))
             .set_selected_item(cx, self.language.index());
         self.apply_i18n(cx);
         let path = project_path();
@@ -246,7 +249,7 @@ impl MatchEvent for App {
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let map = self.ui.code_map(cx, ids!(map));
-        if let Some(index) = self.ui.drop_down2(cx, ids!(language)).changed(actions) {
+        if let Some(index) = self.ui.drop_down(cx, ids!(language)).changed(actions) {
             self.language = Language::from_index(index);
             self.apply_i18n(cx);
             map.set_language(cx, self.language);
@@ -260,7 +263,7 @@ impl MatchEvent for App {
         if let Some(on) = self.ui.check_box(cx, ids!(three_d)).changed(actions) {
             map.set_3d(cx, on);
         }
-        if let Some(index) = self.ui.drop_down2(cx, ids!(detail_level)).changed(actions) {
+        if let Some(index) = self.ui.drop_down(cx, ids!(detail_level)).changed(actions) {
             let level = match index {
                 1 => DetailLevel::High,
                 2 => DetailLevel::Ultra,
@@ -296,7 +299,7 @@ impl MatchEvent for App {
             let detail = self.custom_detail(cx);
             map.set_custom_detail(cx, detail);
         }
-        if let Some(index) = self.ui.drop_down2(cx, ids!(color_mode)).changed(actions) {
+        if let Some(index) = self.ui.drop_down(cx, ids!(color_mode)).changed(actions) {
             let mode = match index {
                 1 => ColorMode::Recent,
                 2 => ColorMode::Churn,
@@ -346,5 +349,32 @@ impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
+        // The legacy dropdown supports the required BelowInput placement, but
+        // its lazily created overlay is not part of the field-only redraw on
+        // the first open. Redrawing the root after the press makes that first
+        // popup visible while keeping every toolbar menu below its control.
+        if let Event::MouseDown(e) = event {
+            let over_dropdown = self
+                .ui
+                .widget(cx, ids!(color_mode))
+                .area()
+                .rect(cx)
+                .contains(e.abs)
+                || self
+                    .ui
+                    .widget(cx, ids!(detail_level))
+                    .area()
+                    .rect(cx)
+                    .contains(e.abs)
+                || self
+                    .ui
+                    .widget(cx, ids!(language))
+                    .area()
+                    .rect(cx)
+                    .contains(e.abs);
+            if over_dropdown {
+                self.ui.redraw(cx);
+            }
+        }
     }
 }
