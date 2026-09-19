@@ -50,36 +50,44 @@ changes it at runtime. `CODE_MAP_LANG=zh-CN` or `--lang=zh-CN` overrides detecti
 (use `en` for English). Keep translation IDs consistent in both `.ftl` files. The
 `src/i18n.rs` adapter retains the existing `Language` API and handles dynamic formatting.
 
-## Dropdown / locale fix (pinned Makepad checkout)
-
-If upgrading from the previous dropdown fix, apply the supplied
-`code-map-v2.patch` to Code Map (or use the full source archive). **Also apply**
-`patches/makepad-dropdown-v2.patch` to the sibling `../makepad` checkout at
-the commit pinned below; Code Map's `Cargo.toml` uses that local dependency.
-The Makepad fix invalidates the popup's **own overlay draw list** on opening,
-schedules one redraw after first-use menu-item creation, and adds `set_label`
-for Slider captions without changing slider values. Do not apply patches twice.
-Build and visually check the first opening of each dropdown after patching.
-
 ## Setup
 
-You need Rust (https://rustup.rs) and a Makepad checkout **next to** this repo, because
-`Cargo.toml` points at `../makepad`:
+Install [Rust](https://rustup.rs) and clone this fork alongside Makepad. The current
+`Cargo.toml` references `../makepad/widgets` and several Makepad crates by local path,
+so a sibling Makepad checkout is still required. This repository does not contain or
+provide manual patch files; the Code Map UI changes are tracked in its Rust source.
 
 ```sh
 mkdir makepad-demo && cd makepad-demo
 git clone https://github.com/makepad/makepad.git
-git -C makepad checkout a4ea2536a4ab223fb31e0282be923191230f44fe   # dev branch, 2026-09-15
-git clone https://github.com/Peeter95/code-map.git
+git -C makepad checkout a4ea2536a4ab223fb31e0282be923191230f44fe
+git clone https://github.com/ChuanYuanNotBoat/code-map.git
+cd code-map
 ```
 
-Makepad's API moves fast, so stick to the pinned commit above. Newer commits may or may not
-build.
+The Makepad commit above is the version pinned by the original setup instructions.
+Makepad's API changes quickly, so other versions may require compatibility work.
+The Rust source in this repository does not include changes made to an individual
+contributor's `../makepad` working tree. A clean checkout of this dependency has not
+been verified across platforms: if it fails, please report the failure and fix the
+tracked code or pin a reproducible upstream dependency rather than relying on an
+unpublished local patch.
+
+Before contributing, run:
+
+```sh
+cargo fmt --check
+cargo check
+cargo test
+```
+
+Also verify the first opening of each toolbar dropdown, language switching and the
+Custom detail sliders in 2D and 3D. These GUI interactions are not covered by a
+successful compile alone.
 
 ## Run
 
 ```sh
-cd code-map
 cargo run --release -- /path/to/some/project          # 2D treemap
 cargo run --release -- /path/to/some/project --3d     # start in 3D city mode
 ```
@@ -120,5 +128,5 @@ cargo run --release --bin scan -- /path/to/some/project [ignored/path ...]
 | `src/map_view/city.rs` | 3D city rendering (offscreen pass, cubes, projected labels) |
 | `src/orbit.rs` | Orbit camera for 3D mode |
 
-Tested on macOS. Makepad also targets Windows, Linux and web, but this app has not been tried
-there.
+The original project documented testing on macOS; compatibility with other platforms
+and a fresh Makepad checkout still needs independent verification.
