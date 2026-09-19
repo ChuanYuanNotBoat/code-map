@@ -52,12 +52,14 @@ script_mod! {
                         color_mode := DropDown{
                             width: 150
                             labels: ["File type" "Recently changed" "Most changed"]
+                            popup_menu_position: #(makepad_widgets::drop_down::PopupMenuPosition::BelowInput)
                         }
                         three_d := CheckBox{text: "3D" active: false}
                         detail_level := DropDown{
                             width: 110
                             labels: ["Normal" "High" "Ultra"]
                             selected_item: 0
+                            popup_menu_position: #(makepad_widgets::drop_down::PopupMenuPosition::BelowInput)
                         }
                         fit_button := Button{text: "Fit"}
                         show_ignored := CheckBox{text: "Show ignored" active: true}
